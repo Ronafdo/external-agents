@@ -1,0 +1,7 @@
+[tasks.build]
+description = "Build the Aider protocol agent and launcher"
+run = "go build -o entire-agent-aider ./cmd/entire-agent-aider && go build -o aider-entire ./cmd/aider-entire"
+
+[tasks.test]
+description = "Run Aider agent tests"
+run = "go test ./..."
