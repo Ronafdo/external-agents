@@ -56,6 +56,21 @@ test -s "$journal"
 grep -q '"prompt_digest"' "$journal"
 grep -q '"test_evidence"' "$journal"
 ! grep -q 'fixture prompt' "$journal"
+
+decision_file="$probe_dir/continuity-decision.json"
+printf '%s\n' '{"goal":"Verify safe session recovery","assumptions":["The canonical journal is available"],"failures":[],"open_risks":["A developer must explicitly choose the next instruction"]}' > "$decision_file"
+decision_arg="$decision_file"
+if file "$launcher_bin" | grep -qi 'PE32'; then
+  decision_arg="$(wslpath -w "$decision_file")"
+fi
+"$launcher_bin" checkpoint --repo "$repo_arg" --session verifier --brief-file "$decision_arg"
+brief="$repo_dir/.entire/aider-sessions/verifier/continuity-brief.json"
+test -s "$brief"
+! grep -q 'fixture prompt' "$brief"
+resumed="$probe_dir/resumed-brief.json"
+"$launcher_bin" --repo "$repo_arg" --resume verifier > "$resumed"
+cmp -s "$brief" "$resumed"
+
 printf 'captured journal: %s\n' "$journal"
 cat "$journal"
 
@@ -65,4 +80,4 @@ printf '%s\n' "$hook_payload"
 printf '%s' "$hook_payload" | grep -q 'prompt_sha256:'
 ! printf '%s' "$hook_payload" | grep -q 'fixture prompt'
 printf '%s\n' '{bad json' | "$agent_bin" parse-hook --hook turn-start >/dev/null 2>/dev/null && exit 1 || true
-echo 'PASS: fixture session was isolated, redacted, inspectable, and malformed hook input failed safely.'
+echo 'PASS: fixture session was isolated, redacted, checkpointed, safely recoverable, and malformed hook input failed safely.'

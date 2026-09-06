@@ -24,6 +24,11 @@ import (
 
 const protocolVersion = 1
 
+const (
+	continuityBriefVersion  = 1
+	continuityBriefFilename = "continuity-brief.json"
+)
+
 type capabilities struct {
 	Hooks              bool `json:"hooks"`
 	TranscriptAnalyzer bool `json:"transcript_analyzer"`
@@ -67,24 +72,26 @@ type session struct {
 // journalEvent is intentionally small and append-only. It is both the
 // launcher journal and the parse-hook payload format.
 type journalEvent struct {
-	Event      string `json:"event"`
-	SessionID  string `json:"session_id"`
-	SessionRef string `json:"session_ref,omitempty"`
-	RepoPath   string `json:"repo_path,omitempty"`
-	Timestamp  string `json:"timestamp"`
+	Event             string `json:"event"`
+	SessionID         string `json:"session_id"`
+	PreviousSessionID string `json:"previous_session_id,omitempty"`
+	SessionRef        string `json:"session_ref,omitempty"`
+	RepoPath          string `json:"repo_path,omitempty"`
+	Timestamp         string `json:"timestamp"`
 	// Prompt is accepted only to migrate legacy journals. New journal entries
 	// must use PromptDigest, which is deliberately non-reversible.
-	Prompt       string         `json:"prompt,omitempty"`
-	PromptDigest string         `json:"prompt_digest,omitempty"`
-	Model        string         `json:"model,omitempty"`
-	Modified     []string       `json:"modified_files,omitempty"`
-	New          []string       `json:"new_files,omitempty"`
-	Deleted      []string       `json:"deleted_files,omitempty"`
-	TestEvidence []testEvidence `json:"test_evidence,omitempty"`
-	Outcome      string         `json:"outcome,omitempty"`
-	DurationMS   int64          `json:"duration_ms,omitempty"`
-	ExitCode     *int           `json:"exit_code,omitempty"`
-	FailureKind  string         `json:"failure_kind,omitempty"`
+	Prompt          string           `json:"prompt,omitempty"`
+	PromptDigest    string           `json:"prompt_digest,omitempty"`
+	Model           string           `json:"model,omitempty"`
+	Modified        []string         `json:"modified_files,omitempty"`
+	New             []string         `json:"new_files,omitempty"`
+	Deleted         []string         `json:"deleted_files,omitempty"`
+	TestEvidence    []testEvidence   `json:"test_evidence,omitempty"`
+	Outcome         string           `json:"outcome,omitempty"`
+	DurationMS      int64            `json:"duration_ms,omitempty"`
+	ExitCode        *int             `json:"exit_code,omitempty"`
+	FailureKind     string           `json:"failure_kind,omitempty"`
+	ContinuityBrief *continuityBrief `json:"continuity_brief,omitempty"`
 	// Error is accepted only to migrate legacy journals. It is never emitted
 	// because tool errors can contain prompt, response, or credential data.
 	Error string `json:"error,omitempty"`
@@ -98,6 +105,43 @@ type testEvidence struct {
 	Outcome       string `json:"outcome"`
 	ExitCode      int    `json:"exit_code"`
 	DurationMS    int64  `json:"duration_ms"`
+}
+
+// continuityDecision is developer-authored, curated checkpoint input. It is
+// read from a file so potentially sensitive text never has to travel in argv.
+// The launcher stores only its redacted form in the Continuity Brief.
+type continuityDecision struct {
+	Goal        string   `json:"goal"`
+	Assumptions []string `json:"assumptions"`
+	Failures    []string `json:"failures"`
+	OpenRisks   []string `json:"open_risks"`
+}
+
+// continuityEvidence is deliberately made entirely from canonical journal
+// data. It never includes raw Aider history, command text, test output, model
+// responses, or credentials.
+type continuityEvidence struct {
+	IntegrityDigest string         `json:"integrity_digest"`
+	Model           string         `json:"model,omitempty"`
+	ModifiedFiles   []string       `json:"modified_files,omitempty"`
+	NewFiles        []string       `json:"new_files,omitempty"`
+	DeletedFiles    []string       `json:"deleted_files,omitempty"`
+	TestEvidence    []testEvidence `json:"test_evidence,omitempty"`
+}
+
+// continuityBrief is the durable, checkpoint-safe handoff artifact. A copy is
+// stored beside the isolated session for direct recovery and embedded in the
+// append-only journal milestone so Entire can retain it with the session.
+type continuityBrief struct {
+	SchemaVersion   int                `json:"schema_version"`
+	SessionID       string             `json:"session_id"`
+	CreatedAt       string             `json:"created_at"`
+	Goal            string             `json:"goal"`
+	VerifiedOutcome string             `json:"verified_outcome"`
+	Evidence        continuityEvidence `json:"evidence"`
+	Assumptions     []string           `json:"assumptions"`
+	Failures        []string           `json:"failures"`
+	OpenRisks       []string           `json:"open_risks"`
 }
 
 type stringList []string
@@ -180,7 +224,7 @@ func Run(command string, args []string, stdin io.Reader, stdout io.Writer) error
 	case "extract-prompts":
 		return extractPrompts(args, stdout)
 	case "extract-summary":
-		return writeJSON(stdout, map[string]any{"summary": "", "has_summary": false})
+		return extractSummary(args, stdout)
 	default:
 		return fmt.Errorf("unknown subcommand: %s", command)
 	}
@@ -335,14 +379,61 @@ func writeSession(stdin io.Reader) error {
 	if s.SessionRef == "" {
 		return errors.New("session_ref is required")
 	}
-	safe, _, _, err := sanitizeNativeData(s.NativeData)
+	safe, canonical, events, err := sanitizeNativeData(s.NativeData)
 	if err != nil {
 		return err
+	}
+	// A checkpoint restore can land in a fresh checkout. For canonical Aider
+	// journals, rewrite only the location metadata to the new repo-scoped
+	// session reference; the embedded Continuity Brief remains the source of
+	// truth and raw Aider histories are never reconstructed.
+	if canonical {
+		id, err := singleSessionID(events)
+		if err != nil {
+			return err
+		}
+		root, err := filepath.Abs(repoPath(""))
+		if err != nil {
+			return err
+		}
+		// Keep the protocol's generic opaque/session-copy behavior intact when
+		// Entire gives this agent a different target Session ID. A real
+		// checkpoint restore preserves its ID; only then is it safe and useful
+		// to rewrite workstation-local location metadata for the new checkout.
+		if id != "" && (s.SessionID == "" || s.SessionID == id) && validateSessionRef(s.SessionRef, root, id) == nil {
+			targetRef, err := filepath.Abs(s.SessionRef)
+			if err != nil {
+				return err
+			}
+			for i := range events {
+				events[i].SessionRef = targetRef
+				events[i].RepoPath = root
+			}
+			safe, err = encodeJournalEvents(events)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(s.SessionRef), 0700); err != nil {
 		return err
 	}
 	return writePrivateFile(s.SessionRef, safe)
+}
+
+func encodeJournalEvents(events []journalEvent) ([]byte, error) {
+	lines := make([][]byte, 0, len(events))
+	for _, event := range events {
+		encoded, err := json.Marshal(sanitizeJournalEvent(event))
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, encoded)
+	}
+	if len(lines) == 0 {
+		return nil, nil
+	}
+	return append(bytes.Join(lines, []byte("\n")), '\n'), nil
 }
 func chunk(args []string, stdin io.Reader, stdout io.Writer) error {
 	fs := flags("chunk-transcript", args)
@@ -518,6 +609,44 @@ func extractPrompts(args []string, stdout io.Writer) error {
 	return writeJSON(stdout, map[string]any{"prompts": prompts})
 }
 
+// extractSummary exposes the latest explicit checkpoint milestone through the
+// protocol's existing summary seam. This lets Entire include the same redacted
+// handoff context it stores in the canonical transcript.
+func extractSummary(args []string, stdout io.Writer) error {
+	fs := flags("extract-summary", args)
+	ref := fs.String("session-ref", "", "ref")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *ref == "" {
+		return errors.New("session-ref is required")
+	}
+	if err := validateCanonicalJournalRef(*ref); err != nil {
+		return writeJSON(stdout, map[string]any{"summary": "", "has_summary": false})
+	}
+	sessionID := filepath.Base(filepath.Dir(*ref))
+	root, err := filepath.Abs(repoPath(""))
+	if err != nil {
+		return writeJSON(stdout, map[string]any{"summary": "", "has_summary": false})
+	}
+	if err := validateSessionRef(*ref, root, sessionID); err != nil {
+		return writeJSON(stdout, map[string]any{"summary": "", "has_summary": false})
+	}
+	data, err := readContinuityBrief(root, sessionID)
+	if err != nil {
+		return writeJSON(stdout, map[string]any{"summary": "", "has_summary": false})
+	}
+	var brief continuityBrief
+	if err := decodeStrictJSON(data, &brief); err != nil {
+		return writeJSON(stdout, map[string]any{"summary": "", "has_summary": false})
+	}
+	// The canonical brief is already a compact, deterministic JSON document.
+	// Returning it whole (rather than a lossy prose digest) ensures Entire's
+	// checkpoint context retains the assumptions, failures, open risks, and
+	// detailed Evidence Records required to make recovery actionable.
+	return writeJSON(stdout, map[string]any{"summary": string(data), "has_summary": true})
+}
+
 var (
 	secretPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)\b(?:gsk|sk|rk|xai)[_-][A-Za-z0-9_-]+`),
@@ -572,7 +701,7 @@ func safePromptDigest(value string) string {
 
 func safeOutcome(value string) string {
 	switch value {
-	case "passed", "failed", "skipped", "running":
+	case "passed", "failed", "skipped", "running", "unverified":
 		return value
 	case "":
 		return ""
@@ -592,6 +721,55 @@ func safeFailureKind(value string) string {
 	}
 }
 
+func safeVerifiedOutcome(value string) string {
+	switch value {
+	case "passed", "failed", "unverified":
+		return value
+	default:
+		return "unverified"
+	}
+}
+
+func redactDecision(value string) string {
+	return redactText(value, 240)
+}
+
+func sanitizeContinuityBrief(brief continuityBrief) continuityBrief {
+	brief.SchemaVersion = continuityBriefVersion
+	brief.SessionID = redactText(brief.SessionID, 128)
+	brief.CreatedAt = redactText(brief.CreatedAt, 64)
+	brief.Goal = redactDecision(brief.Goal)
+	brief.VerifiedOutcome = safeVerifiedOutcome(brief.VerifiedOutcome)
+	brief.Evidence.Model = redactText(brief.Evidence.Model, 192)
+	if !sha256Digest.MatchString(brief.Evidence.IntegrityDigest) {
+		brief.Evidence.IntegrityDigest = contentDigest(brief.Evidence.IntegrityDigest)
+	}
+	brief.Evidence.ModifiedFiles = unique(brief.Evidence.ModifiedFiles)
+	brief.Evidence.NewFiles = unique(brief.Evidence.NewFiles)
+	brief.Evidence.DeletedFiles = unique(brief.Evidence.DeletedFiles)
+	for i := range brief.Evidence.TestEvidence {
+		test := &brief.Evidence.TestEvidence[i]
+		if !sha256Digest.MatchString(test.CommandDigest) {
+			test.CommandDigest = contentDigest(test.CommandDigest)
+		}
+		test.Outcome = safeOutcome(test.Outcome)
+	}
+	brief.Assumptions = sanitizeDecisions(brief.Assumptions)
+	brief.Failures = sanitizeDecisions(brief.Failures)
+	brief.OpenRisks = sanitizeDecisions(brief.OpenRisks)
+	return brief
+}
+
+func sanitizeDecisions(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if safe := redactDecision(value); safe != "" {
+			result = append(result, safe)
+		}
+	}
+	return unique(result)
+}
+
 // sanitizeJournalEvent is the one-way boundary from native Aider data to
 // Entire's durable continuity context and hook payloads.
 func sanitizeJournalEvent(event journalEvent) journalEvent {
@@ -608,12 +786,17 @@ func sanitizeJournalEvent(event journalEvent) journalEvent {
 	}
 	event.Error = ""
 	event.FailureKind = safeFailureKind(event.FailureKind)
+	event.PreviousSessionID = redactText(event.PreviousSessionID, 128)
 	for i := range event.TestEvidence {
 		test := &event.TestEvidence[i]
 		if !sha256Digest.MatchString(test.CommandDigest) {
 			test.CommandDigest = contentDigest(test.CommandDigest)
 		}
 		test.Outcome = safeOutcome(test.Outcome)
+	}
+	if event.ContinuityBrief != nil {
+		brief := sanitizeContinuityBrief(*event.ContinuityBrief)
+		event.ContinuityBrief = &brief
 	}
 	return event
 }
@@ -746,6 +929,398 @@ func writePrivateFile(path string, data []byte) error {
 	}
 	return f.Sync()
 }
+
+// Checkpoint records an explicit, decision-rich Continuity Brief. The brief
+// is written locally for recovery and embedded in the append-only journal so
+// Entire captures it as part of the external-agent session transcript.
+func Checkpoint(args []string, stdout io.Writer) error {
+	fs := flags("checkpoint", args)
+	repo := fs.String("repo", "", "repository path")
+	sessionID := fs.String("session", "", "Aider Session name")
+	briefFile := fs.String("brief-file", "", "JSON file containing curated checkpoint decisions")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := validateSessionName(*sessionID); err != nil {
+		return err
+	}
+	root, err := filepath.Abs(repoPath(*repo))
+	if err != nil {
+		return err
+	}
+	release, err := acquireEvidenceLock(root, "checkpoint-"+*sessionID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	dir, journal, _, events, err := readCanonicalSession(root, *sessionID)
+	if err != nil {
+		return err
+	}
+	briefPath := filepath.Join(dir, continuityBriefFilename)
+	if _, err := os.Lstat(briefPath); err == nil {
+		// A prior attempt can have attached the local brief and milestone but
+		// failed while notifying Entire. Validate that durable state, then retry
+		// only the supported checkpoint notification. This never launches Aider,
+		// changes source files, or appends a duplicate milestone.
+		briefData, err := readContinuityBrief(root, *sessionID)
+		if err != nil {
+			return err
+		}
+		var brief continuityBrief
+		if err := decodeStrictJSON(briefData, &brief); err != nil {
+			return err
+		}
+		if err := notifyCheckpointMilestone(root, journal, brief); err != nil {
+			return err
+		}
+		_, err = stdout.Write(briefData)
+		return err
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if *briefFile == "" {
+		return errors.New("--brief-file is required when creating a Continuity Brief")
+	}
+	decision, err := readContinuityDecision(*briefFile)
+	if err != nil {
+		return err
+	}
+	brief, err := buildContinuityBrief(*sessionID, events, decision)
+	if err != nil {
+		return err
+	}
+	briefData, err := json.Marshal(brief)
+	if err != nil {
+		return err
+	}
+	if err := writePrivateFile(briefPath, briefData); err != nil {
+		return err
+	}
+	milestone := journalEvent{
+		Event:           "checkpoint-milestone",
+		SessionID:       *sessionID,
+		SessionRef:      journal,
+		RepoPath:        root,
+		Timestamp:       brief.CreatedAt,
+		Outcome:         brief.VerifiedOutcome,
+		ContinuityBrief: &brief,
+	}
+	if err := appendEvent(journal, milestone); err != nil {
+		if removeErr := os.Remove(briefPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("attach Continuity Brief: %w (also could not remove unattached brief: %v)", err, removeErr)
+		}
+		return err
+	}
+	if err := notifyCheckpointMilestone(root, journal, brief); err != nil {
+		// The milestone and its sidecar are now a complete, recoverable local
+		// checkpoint. Leave them intact so a later identical `checkpoint`
+		// command can retry only the Entire notification.
+		return err
+	}
+	_, err = stdout.Write(briefData)
+	return err
+}
+
+// Resume intentionally performs no Aider launch and no filesystem mutation.
+// It is the fresh-terminal recovery step: show the validated brief, let the
+// developer inspect it, and wait for a separate explicit instruction before
+// any new coding session starts.
+func Resume(args []string, stdout io.Writer) error {
+	fs := flags("resume", args)
+	repo := fs.String("repo", "", "repository path")
+	resumeID := fs.String("resume", "", "Aider Session name")
+	sessionID := fs.String("session", "", "Aider Session name")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *resumeID != "" && *sessionID != "" && *resumeID != *sessionID {
+		return errors.New("--resume and --session must name the same Aider Session")
+	}
+	id := *resumeID
+	if id == "" {
+		id = *sessionID
+	}
+	if err := validateSessionName(id); err != nil {
+		return err
+	}
+	root, err := filepath.Abs(repoPath(*repo))
+	if err != nil {
+		return err
+	}
+	briefData, err := readContinuityBrief(root, id)
+	if err != nil {
+		return err
+	}
+	_, err = stdout.Write(briefData)
+	return err
+}
+
+func readCanonicalSession(root, sessionID string) (string, string, []byte, []journalEvent, error) {
+	if err := validateSessionName(sessionID); err != nil {
+		return "", "", nil, nil, err
+	}
+	dir := filepath.Join(sessionDir(root), sessionID)
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", "", nil, nil, fmt.Errorf("Aider Session %q: %w", sessionID, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", "", nil, nil, errors.New("Aider Session directory is not a private directory")
+	}
+	journal := filepath.Join(dir, "events.jsonl")
+	info, err = os.Lstat(journal)
+	if err != nil {
+		return "", "", nil, nil, fmt.Errorf("Aider Session journal: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return "", "", nil, nil, errors.New("Aider Session journal is not a regular file")
+	}
+	raw, err := os.ReadFile(journal)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	safe, canonical, events, err := sanitizeNativeData(raw)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	if !canonical {
+		return "", "", nil, nil, errors.New("Aider Session journal is not canonical Aider data")
+	}
+	if !bytes.Equal(raw, safe) {
+		return "", "", nil, nil, errors.New("Aider Session journal is not redacted canonical data")
+	}
+	id, err := singleSessionID(events)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	if id != sessionID {
+		return "", "", nil, nil, fmt.Errorf("Aider Session journal %q does not match requested session %q", id, sessionID)
+	}
+	for _, event := range events {
+		if event.SessionRef == "" {
+			continue
+		}
+		if err := validateSessionRef(event.SessionRef, root, sessionID); err != nil {
+			return "", "", nil, nil, fmt.Errorf("Aider Session journal has an invalid session_ref: %w", err)
+		}
+	}
+	return dir, journal, raw, events, nil
+}
+
+func readContinuityDecision(path string) (continuityDecision, error) {
+	if path == "" {
+		return continuityDecision{}, errors.New("--brief-file is required")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return continuityDecision{}, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return continuityDecision{}, errors.New("continuity decision file is not a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return continuityDecision{}, err
+	}
+	var decision continuityDecision
+	if err := decodeStrictJSON(data, &decision); err != nil {
+		return continuityDecision{}, fmt.Errorf("parse continuity decision: %w", err)
+	}
+	decision.Goal = redactDecision(decision.Goal)
+	decision.Assumptions = sanitizeDecisions(decision.Assumptions)
+	decision.Failures = sanitizeDecisions(decision.Failures)
+	decision.OpenRisks = sanitizeDecisions(decision.OpenRisks)
+	if decision.Goal == "" {
+		return continuityDecision{}, errors.New("continuity decision requires a goal")
+	}
+	return decision, nil
+}
+
+func buildContinuityBrief(sessionID string, events []journalEvent, decision continuityDecision) (continuityBrief, error) {
+	var (
+		model                      string
+		lastOutcome                string
+		modified, created, deleted []string
+		tests                      []testEvidence
+	)
+	for _, event := range events {
+		if event.Model != "" {
+			model = event.Model
+		}
+		modified = append(modified, event.Modified...)
+		created = append(created, event.New...)
+		deleted = append(deleted, event.Deleted...)
+		tests = append(tests, event.TestEvidence...)
+		if event.Event == "turn-end" {
+			lastOutcome = event.Outcome
+		}
+	}
+	verifiedOutcome := "unverified"
+	hasFileEvidence := len(modified) > 0 || len(created) > 0 || len(deleted) > 0
+	allTestsPassed := len(tests) > 0
+	for _, test := range tests {
+		if test.Outcome != "passed" {
+			allTestsPassed = false
+			break
+		}
+	}
+	if lastOutcome == "failed" {
+		verifiedOutcome = "failed"
+	} else if lastOutcome == "passed" && hasFileEvidence && allTestsPassed {
+		verifiedOutcome = "passed"
+	}
+	brief := continuityBrief{
+		SchemaVersion:   continuityBriefVersion,
+		SessionID:       sessionID,
+		CreatedAt:       time.Now().UTC().Format(time.RFC3339),
+		Goal:            decision.Goal,
+		VerifiedOutcome: verifiedOutcome,
+		Evidence: continuityEvidence{
+			IntegrityDigest: continuityEvidenceDigest(events),
+			Model:           model,
+			ModifiedFiles:   unique(modified),
+			NewFiles:        unique(created),
+			DeletedFiles:    unique(deleted),
+			TestEvidence:    tests,
+		},
+		Assumptions: decision.Assumptions,
+		Failures:    decision.Failures,
+		OpenRisks:   decision.OpenRisks,
+	}
+	return sanitizeContinuityBrief(brief), nil
+}
+
+// continuityEvidenceDigest deliberately excludes workstation-local references.
+// Entire can restore a session into another checkout, where SessionRef and
+// RepoPath necessarily change even though the decision and its evidence do not.
+func continuityEvidenceDigest(events []journalEvent) string {
+	lines := make([][]byte, 0, len(events))
+	for _, event := range events {
+		normalized := sanitizeJournalEvent(event)
+		normalized.SessionRef = ""
+		normalized.RepoPath = ""
+		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return contentDigest("unencodable-continuity-evidence")
+		}
+		lines = append(lines, encoded)
+	}
+	return contentDigest(string(bytes.Join(lines, []byte("\n"))))
+}
+
+func readContinuityBrief(root, sessionID string) ([]byte, error) {
+	_, _, journalData, _, err := readCanonicalSession(root, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	embedded, prefixDigest, err := latestAttachedBrief(journalData)
+	if err != nil {
+		return nil, err
+	}
+	var embeddedBrief continuityBrief
+	if err := decodeStrictJSON(embedded, &embeddedBrief); err != nil {
+		return nil, fmt.Errorf("parse embedded Continuity Brief: %w", err)
+	}
+	canonicalBrief := sanitizeContinuityBrief(embeddedBrief)
+	canonical, err := json.Marshal(canonicalBrief)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(embedded, canonical) {
+		return nil, errors.New("embedded Continuity Brief is not canonical redacted data")
+	}
+	if canonicalBrief.SessionID != sessionID {
+		return nil, errors.New("Continuity Brief does not belong to the requested Aider Session")
+	}
+	if canonicalBrief.Goal == "" {
+		return nil, errors.New("Continuity Brief has no goal")
+	}
+	if canonicalBrief.Evidence.IntegrityDigest != prefixDigest {
+		return nil, errors.New("Continuity Brief integrity digest does not match its journal evidence")
+	}
+
+	// Entire restores the canonical transcript, not launcher-local sidecars.
+	// The embedded milestone is therefore authoritative and lets a fresh
+	// checkout recover without raw histories or a terminal scrollback.
+	path := filepath.Join(sessionDir(root), sessionID, continuityBriefFilename)
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return canonical, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("Continuity Brief: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("Continuity Brief is not a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var sidecar continuityBrief
+	if err := decodeStrictJSON(data, &sidecar); err != nil {
+		return nil, fmt.Errorf("parse Continuity Brief: %w", err)
+	}
+	safeSidecar := sanitizeContinuityBrief(sidecar)
+	sidecarData, err := json.Marshal(safeSidecar)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(data, sidecarData) {
+		return nil, errors.New("Continuity Brief is not canonical redacted data")
+	}
+	if !bytes.Equal(sidecarData, canonical) {
+		return nil, errors.New("Continuity Brief sidecar does not match the canonical journal milestone")
+	}
+	return canonical, nil
+}
+
+func latestAttachedBrief(journalData []byte) ([]byte, string, error) {
+	var latest []byte
+	var latestDigest string
+	var prior []journalEvent
+	for _, line := range bytes.SplitAfter(journalData, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		var event journalEvent
+		if err := json.Unmarshal(trimmed, &event); err != nil {
+			return nil, "", fmt.Errorf("parse canonical journal milestone: %w", err)
+		}
+		if event.Event == "checkpoint-milestone" && event.ContinuityBrief != nil {
+			brief, err := json.Marshal(sanitizeContinuityBrief(*event.ContinuityBrief))
+			if err != nil {
+				return nil, "", err
+			}
+			latest = brief
+			latestDigest = continuityEvidenceDigest(prior)
+		}
+		prior = append(prior, sanitizeJournalEvent(event))
+	}
+	if latest == nil {
+		return nil, "", errors.New("Continuity Brief is not attached to the canonical journal")
+	}
+	return latest, latestDigest, nil
+}
+
+func decodeStrictJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("unexpected second JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
 func unique(items []string) []string {
 	set := map[string]bool{}
 	for _, v := range items {
@@ -773,7 +1348,8 @@ func Launch(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	message := fs.String("message", "", "disabled for privacy; use --message-file")
 	messageFile := fs.String("message-file", "", "one-shot message file")
 	intent := fs.String("intent", "", "safe, redacted purpose label for the journal")
-	resume := fs.String("resume", "", "resume an existing session")
+	resume := fs.String("resume", "", "retrieve a saved Continuity Brief without launching Aider")
+	continueFrom := fs.String("continue-from", "", "start a fresh Aider Session from a saved Continuity Brief")
 	aiderBin := fs.String("aider-bin", "aider", "Aider executable")
 	model := fs.String("model", "", "Aider model")
 	var testCommands stringList
@@ -784,11 +1360,17 @@ func Launch(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if *message != "" {
 		return errors.New("raw --message is disabled for privacy; use --message-file")
 	}
-	if *resume != "" && *name != "" && *name != *resume {
-		return errors.New("--name and --resume must name the same session")
+	if *resume != "" && *continueFrom != "" {
+		return errors.New("--resume and --continue-from cannot be used together")
 	}
 	if err := rejectOwnedAiderArgs(fs.Args()); err != nil {
 		return err
+	}
+	if *resume != "" {
+		if *name != "" || *messageFile != "" || strings.TrimSpace(*intent) != "" || *model != "" || *aiderBin != "aider" || len(testCommands) != 0 {
+			return errors.New("--resume only retrieves a Continuity Brief; use --continue-from with an explicit --message-file to start a new Aider Session")
+		}
+		return Resume([]string{"--repo", *repo, "--resume", *resume}, stdout)
 	}
 	var prompt string
 	if *messageFile != "" {
@@ -805,8 +1387,29 @@ func Launch(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *resume != "" {
-		*name = *resume
+	journalPrompt := prompt
+	var (
+		previousSessionID string
+		previousBrief     *continuityBrief
+	)
+	if *continueFrom != "" {
+		if err := validateSessionName(*continueFrom); err != nil {
+			return err
+		}
+		if journalPrompt == "" {
+			return errors.New("--continue-from requires an explicit --message-file instruction")
+		}
+		briefData, err := readContinuityBrief(root, *continueFrom)
+		if err != nil {
+			return err
+		}
+		var brief continuityBrief
+		if err := decodeStrictJSON(briefData, &brief); err != nil {
+			return err
+		}
+		previousSessionID = *continueFrom
+		previousBrief = &brief
+		prompt = continuationPrompt(briefData, journalPrompt)
 	}
 	if *name == "" {
 		*name = "aider-" + time.Now().UTC().Format("20060102-150405.000000000")
@@ -814,12 +1417,15 @@ func Launch(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err := validateSessionName(*name); err != nil {
 		return err
 	}
+	if previousSessionID != "" && *name == previousSessionID {
+		return errors.New("--continue-from must create a fresh Aider Session with a new --name")
+	}
 	release, err := acquireEvidenceLock(root, *name)
 	if err != nil {
 		return err
 	}
 	defer release()
-	dir, err := createSessionDirectory(root, *name, *resume != "")
+	dir, err := createSessionDirectory(root, *name, false)
 	if err != nil {
 		return err
 	}
@@ -834,19 +1440,16 @@ func Launch(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	defer removePrompt()
 	before := gitStatus(root)
 	startTime := time.Now()
-	start := journalEvent{Event: "session-start", SessionID: *name, SessionRef: journal, RepoPath: root, Timestamp: startTime.UTC().Format(time.RFC3339), Model: *model, Outcome: "running"}
+	start := journalEvent{Event: "session-start", SessionID: *name, PreviousSessionID: previousSessionID, SessionRef: journal, RepoPath: root, Timestamp: startTime.UTC().Format(time.RFC3339), Model: *model, Outcome: "running", ContinuityBrief: previousBrief}
 	if err := appendAndNotify(root, journal, start); err != nil {
 		return err
 	}
 	if prompt != "" || strings.TrimSpace(*intent) != "" {
-		if err := appendAndNotify(root, journal, journalEvent{Event: "turn-start", SessionID: *name, SessionRef: journal, RepoPath: root, Timestamp: time.Now().UTC().Format(time.RFC3339), PromptDigest: promptDigest(prompt, *intent), Model: *model, Outcome: "running"}); err != nil {
+		if err := appendAndNotify(root, journal, journalEvent{Event: "turn-start", SessionID: *name, SessionRef: journal, RepoPath: root, Timestamp: time.Now().UTC().Format(time.RFC3339), PromptDigest: promptDigest(journalPrompt, *intent), Model: *model, Outcome: "running"}); err != nil {
 			return err
 		}
 	}
 	forward := []string{"--chat-history-file", chat, "--input-history-file", inputHistory, "--llm-history-file", llm, "--no-auto-commits"}
-	if *resume != "" {
-		forward = append(forward, "--restore-chat-history")
-	}
 	if *model != "" {
 		forward = append(forward, "--model", *model)
 	}
@@ -1067,6 +1670,14 @@ func stagePrompt(dir, prompt string) (string, func(), error) {
 	return path, cleanup, nil
 }
 
+// continuationPrompt keeps the recovered context and the new developer
+// instruction in the same short-lived private message file. It is assembled
+// only after the developer explicitly opts into --continue-from.
+func continuationPrompt(briefData []byte, instruction string) string {
+	return "Redacted Continuity Brief from the previous Aider Session:\n" + string(briefData) +
+		"\n\nExplicit developer instruction for this new session:\n" + instruction
+}
+
 func runVerificationCommands(repo string, commands []string, stdout, stderr io.Writer) ([]testEvidence, int, error) {
 	results := make([]testEvidence, 0, len(commands))
 	firstFailure := 0
@@ -1180,11 +1791,34 @@ func appendAndNotify(repo, journal string, event journalEvent) error {
 	if err := appendEvent(journal, event); err != nil {
 		return err
 	}
+	return notifyEntire(repo, event)
+}
+
+// notifyCheckpointMilestone asks Entire to capture the already-appended
+// checkpoint-milestone through a supported lifecycle hook. It deliberately
+// does not append a synthetic turn-end event: the canonical transcript keeps
+// the real milestone as the authoritative handoff record.
+func notifyCheckpointMilestone(repo, journal string, brief continuityBrief) error {
+	return notifyEntire(repo, journalEvent{
+		Event:           "turn-end",
+		SessionID:       brief.SessionID,
+		SessionRef:      journal,
+		RepoPath:        repo,
+		Timestamp:       brief.CreatedAt,
+		Outcome:         brief.VerifiedOutcome,
+		ContinuityBrief: &brief,
+	})
+}
+
+func notifyEntire(repo string, event journalEvent) error {
+	event = sanitizeJournalEvent(event)
 	// Before `entire enable`, Aider remains a normal standalone CLI. After
 	// enable, a missing Entire binary is actionable rather than silently losing
 	// a checkpoint lifecycle event.
-	if _, err := os.Stat(markerPath(repo)); err != nil {
+	if _, err := os.Stat(markerPath(repo)); os.IsNotExist(err) {
 		return nil
+	} else if err != nil {
+		return err
 	}
 	bin, err := exec.LookPath("entire")
 	if err != nil {
@@ -1199,7 +1833,7 @@ func appendAndNotify(repo, journal string, event journalEvent) error {
 	cmd.Stdin = bytes.NewReader(payload)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("recorded Aider event but could not notify Entire (%s): %w", strings.TrimSpace(string(output)), err)
+		return fmt.Errorf("could not notify Entire of the recorded Aider event (%s): %w", strings.TrimSpace(string(output)), err)
 	}
 	return nil
 }

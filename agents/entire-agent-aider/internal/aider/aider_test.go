@@ -264,7 +264,7 @@ func TestLauncherRecordsRedactedInteractiveIntent(t *testing.T) {
 	}
 }
 
-func TestLauncherRejectsCrossSessionResumeJournal(t *testing.T) {
+func TestResumeRejectsCrossSessionJournal(t *testing.T) {
 	repo := t.TempDir()
 	initGit(t, repo)
 	fake := writeFakeAider(t, repo, "resume", "resume.txt")
@@ -276,7 +276,8 @@ func TestLauncherRejectsCrossSessionResumeJournal(t *testing.T) {
 	if err := os.Rename(from, to); err != nil {
 		t.Fatal(err)
 	}
-	if err := Launch([]string{"--repo", repo, "--resume", "target", "--aider-bin", fake, "--message-file", writePromptFile(t, "next")}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err == nil || !strings.Contains(err.Error(), "does not match") {
+	var out bytes.Buffer
+	if err := Resume([]string{"--repo", repo, "--resume", "target"}, &out); err == nil || !strings.Contains(err.Error(), "does not match") || out.Len() != 0 {
 		t.Fatalf("cross-session resume must be rejected, got %v", err)
 	}
 	journal, err := os.ReadFile(filepath.Join(to, "events.jsonl"))
@@ -286,6 +287,332 @@ func TestLauncherRejectsCrossSessionResumeJournal(t *testing.T) {
 	if strings.Count(string(journal), `"event":"session-start"`) != 1 || strings.Contains(string(journal), `"session_id":"target"`) {
 		t.Fatalf("cross-session resume appended mixed evidence: %s", journal)
 	}
+}
+
+func TestCheckpointWritesDurableRedactedContinuityBrief(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+
+	const (
+		sessionID = "checkout-milestone"
+		goal      = "Stabilize checkout idempotency"
+		secret    = "gsk_checkpoint-must-never-persist"
+		rawPrompt = "Repair checkout retries with credential " + secret
+	)
+	fake := writeFakeAider(t, repo, "checkpoint", "checkout.txt")
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", sessionID,
+		"--aider-bin", fake,
+		"--message-file", writePromptFile(t, rawPrompt),
+		"--intent", goal,
+		"--model", "groq/test-model",
+		"--test-command", "echo verification",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Native Aider histories are allowed to retain local context, but a
+	// continuity brief must derive exclusively from the redacted journal.
+	history := filepath.Join(sessionDir(repo), sessionID, "chat.history.md")
+	if err := os.WriteFile(history, []byte(rawPrompt+"\nsimulated assistant response "+secret), 0600); err != nil {
+		t.Fatal(err)
+	}
+	decisionFile := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        goal,
+		"assumptions": []string{"The payment provider keeps idempotency keys for 24 hours"},
+		"failures":    []string{"The first staging replay timed out with " + secret},
+		"open_risks":  []string{"A legacy mobile client may retry after the retention window"},
+	})
+
+	var out bytes.Buffer
+	if err := Checkpoint([]string{"--session", sessionID, "--brief-file", decisionFile}, &out); err != nil {
+		t.Fatal(err)
+	}
+	briefPath := filepath.Join(sessionDir(repo), sessionID, "continuity-brief.json")
+	brief, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatalf("checkpoint did not persist a continuity brief: %v", err)
+	}
+	if !json.Valid(brief) {
+		t.Fatalf("continuity brief must be JSON: %s", brief)
+	}
+	assertNoPrivateContent(t, brief, rawPrompt, secret, "simulated assistant response")
+	assertNoPrivateContent(t, out.Bytes(), rawPrompt, secret, "simulated assistant response")
+
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(brief, &document); err != nil {
+		t.Fatal(err)
+	}
+	assertBriefString(t, document, "session_id", sessionID)
+	assertBriefString(t, document, "goal", goal)
+	assertBriefString(t, document, "verified_outcome", "passed")
+	assertBriefStrings(t, document, "assumptions", []string{"The payment provider keeps idempotency keys for 24 hours"})
+	assertBriefStrings(t, document, "failures", []string{"The first staging replay timed out with [REDACTED]"})
+	assertBriefStrings(t, document, "open_risks", []string{"A legacy mobile client may retry after the retention window"})
+
+	var evidence map[string]json.RawMessage
+	if raw, ok := document["evidence"]; !ok || json.Unmarshal(raw, &evidence) != nil {
+		t.Fatalf("continuity brief lacks structured evidence: %s", brief)
+	}
+	assertBriefString(t, evidence, "model", "groq/test-model")
+	assertBriefContainsString(t, evidence, "new_files", "checkout.txt")
+	if raw, ok := evidence["test_evidence"]; !ok || len(raw) == 0 || string(raw) == "null" || string(raw) == "[]" {
+		t.Fatalf("continuity brief must retain safe test evidence: %s", brief)
+	}
+	var integrity string
+	if raw, ok := evidence["integrity_digest"]; !ok || json.Unmarshal(raw, &integrity) != nil || !strings.HasPrefix(integrity, "sha256:") {
+		t.Fatalf("continuity brief must include an evidence integrity digest: %s", brief)
+	}
+}
+
+func TestCheckpointNotifiesEntireThroughSupportedTurnEnd(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+
+	const sessionID = "notified-checkpoint"
+	fakeAider := writeFakeAider(t, repo, "notify", "notify.txt")
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", sessionID,
+		"--aider-bin", fakeAider,
+		"--message-file", writePromptFile(t, "finish notification coverage"),
+		"--intent", "Finish notification coverage",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run("install-hooks", []string{"--force"}, nil, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeEntireHook(t, repo)
+	t.Setenv("PATH", repo+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	decision := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        "Tell Entire about the durable checkpoint",
+		"assumptions": []string{},
+		"failures":    []string{},
+		"open_risks":  []string{},
+	})
+	var first bytes.Buffer
+	if err := Checkpoint([]string{"--repo", repo, "--session", sessionID, "--brief-file", decision}, &first); err != nil {
+		t.Fatal(err)
+	}
+	hookArgs, err := os.ReadFile(filepath.Join(repo, "entire-hook.args"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(hookArgs)) != "hooks aider turn-end" {
+		t.Fatalf("checkpoint must notify Entire with a supported capture hook, got %q", hookArgs)
+	}
+
+	// Retrying a notification after it has already created the durable
+	// milestone must not demand the original decision file or append a second
+	// milestone. This is the recovery path if Entire was briefly unavailable.
+	var retried bytes.Buffer
+	if err := Checkpoint([]string{"--repo", repo, "--session", sessionID}, &retried); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Bytes(), retried.Bytes()) {
+		t.Fatalf("checkpoint retry must return the existing brief\nwant=%q\n got=%q", first.Bytes(), retried.Bytes())
+	}
+	journal, err := os.ReadFile(filepath.Join(sessionDir(repo), sessionID, "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(journal), `"event":"checkpoint-milestone"`) != 1 {
+		t.Fatalf("checkpoint retry appended another milestone: %s", journal)
+	}
+}
+
+func TestResumeReturnsExactBriefWithoutRestartingAiderOrMutatingSession(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+
+	const (
+		sessionID = "read-only-resume"
+		secret    = "gsk_resume-must-never-persist"
+		rawPrompt = "Create the initial implementation using " + secret
+	)
+	fake := writeCountingAider(t, repo, "aider", "resume-target.txt")
+	t.Setenv("PATH", repo+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", sessionID,
+		"--aider-bin", fake,
+		"--message-file", writePromptFile(t, rawPrompt),
+		"--intent", "Create initial implementation",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir(repo), sessionID, "chat.history.md"), []byte(rawPrompt+"\nsimulated assistant response "+secret), 0600); err != nil {
+		t.Fatal(err)
+	}
+	decisionFile := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        "Create initial implementation",
+		"assumptions": []string{"The local repository is authoritative"},
+		"failures":    []string{},
+		"open_risks":  []string{"A developer must explicitly choose the next task"},
+	})
+	if err := Checkpoint([]string{"--session", sessionID, "--brief-file", decisionFile}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+
+	journalPath := filepath.Join(sessionDir(repo), sessionID, "events.jsonl")
+	briefPath := filepath.Join(sessionDir(repo), sessionID, "continuity-brief.json")
+	codePath := filepath.Join(repo, "resume-target.txt")
+	invocationsPath := filepath.Join(repo, "aider-invocations.log")
+	journalBefore, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	briefBefore, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codeBefore, err := os.ReadFile(codePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocationsBefore, err := os.ReadFile(invocationsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := Resume([]string{"--repo", repo, "--resume", sessionID}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.Bytes(), briefBefore) {
+		t.Fatalf("resume must return the persisted, machine-readable brief byte-for-byte\nwant=%q\n got=%q", briefBefore, out.Bytes())
+	}
+	if !json.Valid(out.Bytes()) {
+		t.Fatalf("resume output must remain parseable JSON: %s", out.Bytes())
+	}
+	assertNoPrivateContent(t, briefBefore, rawPrompt, secret, "simulated assistant response")
+	assertNoPrivateContent(t, out.Bytes(), rawPrompt, secret, "simulated assistant response")
+	assertFileUnchanged(t, journalPath, journalBefore)
+	assertFileUnchanged(t, briefPath, briefBefore)
+	assertFileUnchanged(t, codePath, codeBefore)
+	assertFileUnchanged(t, invocationsPath, invocationsBefore)
+}
+
+func TestCheckpointAndResumeFailClosedForInvalidOrMismatchedSessionPaths(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+	decisionFile := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        "Safely hand off implementation state",
+		"assumptions": []string{},
+		"failures":    []string{},
+		"open_risks":  []string{},
+	})
+
+	for _, tc := range []struct {
+		name string
+		call func(*bytes.Buffer) error
+	}{
+		{
+			name: "checkpoint rejects a missing session",
+			call: func(out *bytes.Buffer) error {
+				return Checkpoint([]string{"--session", "missing", "--brief-file", decisionFile}, out)
+			},
+		},
+		{
+			name: "resume rejects a missing session",
+			call: func(out *bytes.Buffer) error {
+				return Resume([]string{"--repo", repo, "--resume", "missing"}, out)
+			},
+		},
+		{
+			name: "path traversal session id is rejected",
+			call: func(out *bytes.Buffer) error {
+				return Resume([]string{"--repo", repo, "--resume", ".."}, out)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := tc.call(&out); err == nil || out.Len() != 0 {
+				t.Fatalf("must fail closed without partial output: err=%v stdout=%q", err, out.String())
+			}
+		})
+	}
+
+	// A renamed directory is not the Aider Session named by its journal. A
+	// checkpoint must not attach a brief to that mismatched path.
+	fake := writeFakeAider(t, repo, "mismatch", "mismatch.txt")
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", "source-session",
+		"--aider-bin", fake,
+		"--message-file", writePromptFile(t, "original work"),
+		"--intent", "Original work",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	from := filepath.Join(sessionDir(repo), "source-session")
+	to := filepath.Join(sessionDir(repo), "mismatched-session")
+	if err := os.Rename(from, to); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(to, "events.jsonl")
+	journalBefore, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkpointOut bytes.Buffer
+	if err := Checkpoint([]string{"--session", "mismatched-session", "--brief-file", decisionFile}, &checkpointOut); err == nil || checkpointOut.Len() != 0 {
+		t.Fatalf("mismatched journal path must fail closed: err=%v stdout=%q", err, checkpointOut.String())
+	}
+	assertFileUnchanged(t, journalPath, journalBefore)
+	if _, err := os.Stat(filepath.Join(to, "continuity-brief.json")); !os.IsNotExist(err) {
+		t.Fatalf("mismatched checkpoint must not create a brief: %v", err)
+	}
+
+	// A canonical session without its generated brief cannot be resumed.
+	validID := "no-brief-yet"
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", validID,
+		"--aider-bin", fake,
+		"--message-file", writePromptFile(t, "work without a checkpoint"),
+		"--intent", "Work without a checkpoint",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	validJournal := filepath.Join(sessionDir(repo), validID, "events.jsonl")
+	validJournalBefore, err := os.ReadFile(validJournal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingDecision := filepath.Join(t.TempDir(), "missing-decision.json")
+	var missingDecisionOut bytes.Buffer
+	if err := Checkpoint([]string{"--session", validID, "--brief-file", missingDecision}, &missingDecisionOut); err == nil || missingDecisionOut.Len() != 0 {
+		t.Fatalf("checkpoint with a missing decision file must fail closed: err=%v stdout=%q", err, missingDecisionOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir(repo), validID, "continuity-brief.json")); !os.IsNotExist(err) {
+		t.Fatalf("missing decision file must not create a brief: %v", err)
+	}
+	var resumeOut bytes.Buffer
+	if err := Resume([]string{"--repo", repo, "--resume", validID}, &resumeOut); err == nil || resumeOut.Len() != 0 {
+		t.Fatalf("resume without a brief must fail closed: err=%v stdout=%q", err, resumeOut.String())
+	}
+	assertFileUnchanged(t, validJournal, validJournalBefore)
+
+	// A present but malformed brief is not a recoverable checkpoint. It must
+	// not be printed or used as a route to implicitly restart the session.
+	malformedPath := filepath.Join(sessionDir(repo), validID, "continuity-brief.json")
+	if err := os.WriteFile(malformedPath, []byte("not-json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var malformedOut bytes.Buffer
+	if err := Resume([]string{"--repo", repo, "--resume", validID}, &malformedOut); err == nil || malformedOut.Len() != 0 {
+		t.Fatalf("malformed brief must fail closed: err=%v stdout=%q", err, malformedOut.String())
+	}
+	assertFileUnchanged(t, validJournal, validJournalBefore)
 }
 
 func TestDiffStatusClassifiesTrackedDeletion(t *testing.T) {
@@ -429,6 +756,92 @@ func TestNotificationPayloadSendsOnlyRedactedEvent(t *testing.T) {
 	}
 }
 
+func writeContinuityDecisionFile(t *testing.T, decision map[string]any) string {
+	t.Helper()
+	data, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "continuity-decision.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func assertBriefString(t *testing.T, document map[string]json.RawMessage, key, want string) {
+	t.Helper()
+	raw, ok := document[key]
+	if !ok {
+		t.Fatalf("continuity brief lacks %q", key)
+	}
+	var got string
+	if err := json.Unmarshal(raw, &got); err != nil || got != want {
+		t.Fatalf("continuity brief %q = %q, want %q (err=%v)", key, got, want, err)
+	}
+}
+
+func assertBriefStrings(t *testing.T, document map[string]json.RawMessage, key string, want []string) {
+	t.Helper()
+	raw, ok := document[key]
+	if !ok {
+		t.Fatalf("continuity brief lacks %q", key)
+	}
+	var got []string
+	if err := json.Unmarshal(raw, &got); err != nil || len(got) != len(want) {
+		t.Fatalf("continuity brief %q = %v, want %v (err=%v)", key, got, want, err)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("continuity brief %q = %v, want %v", key, got, want)
+		}
+	}
+}
+
+func assertBriefContainsString(t *testing.T, document map[string]json.RawMessage, key, want string) {
+	t.Helper()
+	raw, ok := document[key]
+	if !ok {
+		t.Fatalf("continuity brief evidence lacks %q", key)
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		t.Fatalf("decode evidence %q: %v", key, err)
+	}
+	if !containsString(values, want) {
+		t.Fatalf("continuity brief evidence %q = %v, want %q", key, values, want)
+	}
+}
+
+func assertFileUnchanged(t *testing.T, path string, before []byte) {
+	t.Helper()
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s after resume: %v", path, err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("resume mutated %s\nbefore=%q\n after=%q", path, before, after)
+	}
+}
+
+func writeCountingAider(t *testing.T, repo, name, changedFile string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(repo, name+".cmd")
+		body := "@echo off\r\necho invoked>> aider-invocations.log\r\necho %* > aider.args\r\necho changed > " + changedFile + "\r\n"
+		if err := os.WriteFile(path, []byte(body), 0700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	path := filepath.Join(repo, name)
+	body := "#!/usr/bin/env sh\nprintf 'invoked\\n' >> aider-invocations.log\nprintf '%s\\n' \"$@\" > aider.args\nprintf 'changed\\n' > " + changedFile + "\n"
+	if err := os.WriteFile(path, []byte(body), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func writeFakeAider(t *testing.T, repo, name, changedFile string) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -445,6 +858,31 @@ func writeFakeAider(t *testing.T, repo, name, changedFile string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeFakeEntireHook(t *testing.T, repo string) {
+	t.Helper()
+	argsPath := filepath.Join(repo, "entire-hook.args")
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(repo, "entire.cmd")
+		body := "@echo off\r\n" +
+			"if /I not \"%1\"==\"hooks\" exit /b 1\r\n" +
+			"if /I not \"%2\"==\"aider\" exit /b 1\r\n" +
+			"if /I not \"%3\"==\"turn-end\" exit /b 1\r\n" +
+			"echo %* > \"" + argsPath + "\"\r\n" +
+			"exit /b 0\r\n"
+		if err := os.WriteFile(path, []byte(body), 0700); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	path := filepath.Join(repo, "entire")
+	body := "#!/usr/bin/env sh\n" +
+		"[ \"$1\" = hooks ] && [ \"$2\" = aider ] && [ \"$3\" = turn-end ] || exit 1\n" +
+		"printf '%s\\n' \"$*\" > " + shellQuote(argsPath) + "\n"
+	if err := os.WriteFile(path, []byte(body), 0700); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func initGit(t *testing.T, repo string) {

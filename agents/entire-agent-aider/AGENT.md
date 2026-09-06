@@ -23,8 +23,8 @@ authoritative JSONL lifecycle journal.
 | session helpers | `.entire/aider-sessions/<id>/events.jsonl` |
 | read/write/chunk transcript | append-only journal bytes |
 | hooks | launcher event payload parsed by `parse-hook`; install writes a repo marker |
-| transcript analyzer | scans typed journal events |
-| resume command | `aider-entire --resume '<id>'` |
+| transcript analyzer | scans typed journal events and exposes the latest milestone brief as a safe summary |
+| resume command | `aider-entire --resume '<id>'` validates and prints a Continuity Brief without launching Aider |
 
 ## Selected Capabilities
 
@@ -39,11 +39,17 @@ authoritative JSONL lifecycle journal.
 
 - Session directory: `.entire/aider-sessions/`
 - Canonical transcript: `<id>/events.jsonl` (redacted-only continuity data)
+- Continuity Brief: `<id>/continuity-brief.json`, embedded again in an explicit
+  `checkpoint-milestone` journal event so Entire can retain it with the session
+  checkpoint. After `entire enable --agent aider`, checkpoint also invokes
+  Entire's supported `turn-end` hook to capture that already-appended milestone.
+  A failed notification leaves the valid local milestone available for an
+  explicit notification-only retry.
 - Supporting raw history: `chat.history.md`, `input.history`, `llm.history`
   (private `0600` Aider-local state; never exposed through the protocol)
 - Verification: unit fixture exercises session discovery, prompt extraction,
   malformed hook errors, redaction across all protocol boundaries, evidence
-  isolation, and a fake Aider executable.
+  isolation, explicit checkpoint/recovery, and a fake Aider executable.
 
 ## E2E Prerequisites
 
@@ -54,5 +60,8 @@ authoritative JSONL lifecycle journal.
 ## Verification Script
 
 `scripts/verify-aider.sh` creates a temporary git repository and fake Aider
-executable, then verifies the exact launcher journal and hook payload shape.
-It is non-destructive and needs neither credentials nor a live model.
+executable, then verifies the exact launcher journal, redacted hook payload,
+explicit local checkpoint, and no-Aider resume shape. Unit tests additionally
+cover the enabled-Entire notification/retry path and sidecar-less transcript
+restore. The script is non-destructive and needs neither credentials nor a live
+model.
