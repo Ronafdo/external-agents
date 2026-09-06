@@ -4,8 +4,16 @@
 
 **Blocked by:** 01: Establish a protocol-recognized Aider Session.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Two sessions cannot mix their histories or Evidence Records.
-- [ ] The journal captures a redacted digest, model configuration, outcome, and file/test evidence.
-- [ ] Tests prove credentials and unredacted prompt content are excluded from persisted continuity context.
+- [x] Two sessions cannot mix their histories or Evidence Records.
+- [x] The journal captures a redacted digest, model configuration, outcome, and file/test evidence.
+- [x] Tests prove credentials and unredacted prompt content are excluded from persisted continuity context.
+
+## Answer
+
+Implemented isolated per-session Aider history and canonical journals with digest-only
+continuity records. Resume validation, history ownership checks, evidence fingerprints,
+and a repository evidence lock prevent cross-session mixing. Tests cover redaction across
+the journal, transcript, hooks, protocol reads, and notifications; credentials, raw prompts,
+model responses, and test output are never persisted in continuity context.

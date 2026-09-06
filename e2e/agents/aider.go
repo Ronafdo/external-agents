@@ -39,7 +39,24 @@ func (a *Aider) RunPrompt(ctx context.Context, dir, prompt string, _ ...Option) 
 	if err != nil {
 		return Output{}, fmt.Errorf("%s not in PATH: %w", a.Binary(), err)
 	}
-	args := []string{"--repo", dir, "--message", prompt}
+	promptFile, err := os.CreateTemp("", "aider-entire-prompt-*")
+	if err != nil {
+		return Output{}, fmt.Errorf("create Aider prompt file: %w", err)
+	}
+	promptPath := promptFile.Name()
+	defer os.Remove(promptPath)
+	if err := promptFile.Chmod(0600); err != nil {
+		_ = promptFile.Close()
+		return Output{}, fmt.Errorf("secure Aider prompt file: %w", err)
+	}
+	if _, err := promptFile.WriteString(prompt); err != nil {
+		_ = promptFile.Close()
+		return Output{}, fmt.Errorf("write Aider prompt file: %w", err)
+	}
+	if err := promptFile.Close(); err != nil {
+		return Output{}, fmt.Errorf("close Aider prompt file: %w", err)
+	}
+	args := []string{"--repo", dir, "--message-file", promptPath}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -58,6 +75,6 @@ func (a *Aider) RunPrompt(ctx context.Context, dir, prompt string, _ ...Option) 
 			code = -1
 		}
 	}
-	return Output{Command: a.Binary() + " --repo " + dir + " --message " + fmt.Sprintf("%q", prompt), Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: code}, err
+	return Output{Command: a.Binary() + " --repo " + dir + " --message-file <redacted>", Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: code}, err
 }
 func (a *Aider) StartSession(context.Context, string) (Session, error) { return nil, nil }

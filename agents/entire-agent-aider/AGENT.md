@@ -24,24 +24,26 @@ authoritative JSONL lifecycle journal.
 | read/write/chunk transcript | append-only journal bytes |
 | hooks | launcher event payload parsed by `parse-hook`; install writes a repo marker |
 | transcript analyzer | scans typed journal events |
-| resume command | `aider-entire resume '<id>'` |
+| resume command | `aider-entire --resume '<id>'` |
 
 ## Selected Capabilities
 
 | Capability | Declared | Justification |
 |---|---:|---|
 | hooks | true | launcher owns lifecycle events |
-| transcript_analyzer | true | JSONL journal has prompts and file deltas |
+| transcript_analyzer | true | JSONL journal has redacted prompt digests and file deltas |
 | transcript_preparer | false | journal is already canonical |
 | token_calculator | false | Aider history is not reliable token accounting |
 
 ## Storage
 
 - Session directory: `.entire/aider-sessions/`
-- Canonical transcript: `<id>/events.jsonl`
+- Canonical transcript: `<id>/events.jsonl` (redacted-only continuity data)
 - Supporting raw history: `chat.history.md`, `input.history`, `llm.history`
+  (private `0600` Aider-local state; never exposed through the protocol)
 - Verification: unit fixture exercises session discovery, prompt extraction,
-  malformed hook errors, and a fake Aider executable.
+  malformed hook errors, redaction across all protocol boundaries, evidence
+  isolation, and a fake Aider executable.
 
 ## E2E Prerequisites
 

@@ -4,6 +4,8 @@ set -eu
 
 agent_bin="${AGENT_BIN:-./entire-agent-aider}"
 launcher_bin="${LAUNCHER_BIN:-./aider-entire}"
+if [ ! -f "$agent_bin" ] && [ -f "${agent_bin}.exe" ]; then agent_bin="${agent_bin}.exe"; fi
+if [ ! -f "$launcher_bin" ] && [ -f "${launcher_bin}.exe" ]; then launcher_bin="${launcher_bin}.exe"; fi
 probe_dir="$(pwd)/.probe-aider-$$"
 repo_dir="$probe_dir/repo"
 keep=0
@@ -40,13 +42,27 @@ command -v aider || printf 'WARN (not on PATH; using fixture)\n'
 "$agent_bin" info
 "$agent_bin" detect
 
-"$launcher_bin" --repo "$repo_arg" --name verifier --aider-bin "$fake_aider" --message 'fixture prompt'
+prompt_file="$probe_dir/fixture-prompt.md"
+printf '%s\n' 'fixture prompt' > "$prompt_file"
+prompt_arg="$prompt_file"
+if file "$launcher_bin" | grep -qi 'PE32'; then
+  prompt_arg="$(wslpath -w "$prompt_file")"
+fi
+"$launcher_bin" --repo "$repo_arg" --name verifier --aider-bin "$fake_aider" \
+  --intent 'verify fixture session' --message-file "$prompt_arg" \
+  --test-command 'echo fixture verification'
 journal="$repo_dir/.entire/aider-sessions/verifier/events.jsonl"
 test -s "$journal"
+grep -q '"prompt_digest"' "$journal"
+grep -q '"test_evidence"' "$journal"
+! grep -q 'fixture prompt' "$journal"
 printf 'captured journal: %s\n' "$journal"
 cat "$journal"
 
-printf '%s\n' '{"event":"turn-start","session_id":"verifier","timestamp":"2026-09-06T00:00:00Z","prompt":"fixture prompt"}' \
-  | "$agent_bin" parse-hook --hook turn-start
+hook_payload="$(printf '%s\n' '{"event":"turn-start","session_id":"verifier","timestamp":"2026-09-06T00:00:00Z","prompt":"fixture prompt"}' \
+  | "$agent_bin" parse-hook --hook turn-start)"
+printf '%s\n' "$hook_payload"
+printf '%s' "$hook_payload" | grep -q 'prompt_sha256:'
+! printf '%s' "$hook_payload" | grep -q 'fixture prompt'
 printf '%s\n' '{bad json' | "$agent_bin" parse-hook --hook turn-start >/dev/null 2>/dev/null && exit 1 || true
-echo 'PASS: fixture session was created, inspectable, and malformed hook input failed safely.'
+echo 'PASS: fixture session was isolated, redacted, inspectable, and malformed hook input failed safely.'
