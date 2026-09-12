@@ -57,44 +57,75 @@ aider-entire checkpoint --session checkout-fix --brief-file ./checkpoint-decisio
 ```
 
 This writes a private `continuity-brief.json` beside the session and embeds the
-same redacted brief in the canonical journal. When this repository has been
-enabled with `entire enable --agent aider`, the command then notifies Entire
-through its supported `turn-end` hook so Entire captures that journal
-milestone. Without that enablement, the local journal and sidecar remain a
-durable checkpoint but no Entire notification is attempted. The brief contains
-the goal, an honest verification status, changed-file and test evidence,
-assumptions, failures, and open risks. It never includes raw prompts, model
-responses, credentials, test command text, or test output.
+redacted brief in the canonical source journal. When this repository has been
+enabled with `entire enable --agent aider`, the command creates a separate,
+redacted, content-addressed `aider-milestone-…` carrier session containing an
+advisory brief and its binding manifest. The manifest contains redaction-
+invariant structural `*_id` values for the source session, the source Brief
+payload hash excluding its milestone ID, and the source evidence hash; together
+they derive the content-addressed carrier ID. Entire may redact human-readable
+Brief prose during attach or restore, so restored prose is redacted advisory
+context rather than byte-for-byte evidence. The source-local Brief and its
+evidence remain strictly validated against the canonical source journal. It
+then uses Entire's real persistence path:
 
-Each Aider Session has one durable Continuity Brief. If the Entire notification
-fails after the brief is written, the command exits nonzero but leaves the
-validated sidecar and journal milestone intact. After Entire is available,
-retry only that notification—without launching Aider, changing code, or
-creating a second milestone—with:
+```sh
+entire session attach aider-milestone-… --agent aider
+```
+
+This is deliberately not a synthetic `turn-end` hook: an explicit milestone
+may contain no new file delta, and a hook would not prove a checkpoint was
+written. The launcher never passes `--force` and disables interactive Git
+prompts, so it never silently amends a developer commit. If Entire chooses its
+manual path and emits an `Entire-Checkpoint:` trailer, the launcher forwards
+that trailer to stderr; apply it yourself before treating the milestone as
+committed. Without enablement, the local journal and sidecar remain a local
+recovery record and no Entire capture is claimed. The brief contains the goal,
+an honest verification status, changed-file and test evidence, assumptions,
+failures, and open risks. It never includes raw prompts, model responses,
+credentials, test command text, or test output.
+
+Each Aider Session has one durable Continuity Brief. Its private publication
+receipt progresses from `prepared` to `attaching` to `attached`. Only a
+confirmed pre-launch/no-write failure returns to `prepared`, leaving the
+validated sidecar, source milestone, and redacted carrier intact for an
+explicit retry that neither launches Aider nor changes code:
 
 ```sh
 aider-entire checkpoint --session checkout-fix
 ```
 
 On this retry path `--brief-file` is not needed (and a new decision file does
-not replace the existing brief).
+not replace the existing brief). Any other attach that starts without a confirmed
+success is ambiguous. If a crash leaves a carrier receipt missing, malformed,
+or `attaching`, the launcher reconciles only with positive evidence: it checks
+`entire session info <carrier> --json` and, when needed,
+`entire checkpoint list --session <carrier> --json`. An empty list, a failed
+query, or any other result that does not prove attachment is not proof of
+absence. The launcher reports an unknown publication state and refuses a
+duplicate attach.
 
-From a fresh terminal, after Entire has restored the canonical
-`.entire/aider-sessions/<id>/events.jsonl` transcript into the checkout,
-retrieve the brief without starting Aider or modifying code. A launcher-local
-sidecar is optional after restoration: the command validates and reconstructs
-the brief from its embedded journal milestone.
+From a fresh terminal, retrieve the brief without starting Aider or modifying
+code. Every brief declares a content-addressed `milestone_session_id`. After
+Entire restores the redacted carrier, use that exact ID with `--resume` or
+`--continue-from`; the launcher deliberately does not search carrier
+directories by original source session ID. A launcher-local source sidecar is
+optional: when it exists, the command strictly validates it against the source
+journal milestone. For a restored carrier, it validates the structural binding
+manifest and presents any Entire-redacted Brief prose as advisory context.
 
 ```sh
-aider-entire --repo /path/to/restored-checkout --resume checkout-fix
-# equivalent: aider-entire resume --session checkout-fix
+aider-entire --repo /path/to/restored-checkout \
+  --resume <milestone_session_id>
+# equivalent: aider-entire resume --session <milestone_session_id>
 ```
 
 The command prints only the stored JSON brief and exits. When the developer is
 ready to make a new change, they must explicitly provide a fresh instruction:
 
 ```sh
-aider-entire --continue-from checkout-fix --name checkout-followup \
+aider-entire --continue-from <milestone_session_id> \
+  --name checkout-followup \
   --intent "Apply the reviewed follow-up" \
   --message-file ./next-instruction.md
 ```

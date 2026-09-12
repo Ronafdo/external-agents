@@ -6,6 +6,7 @@ package aider
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -25,8 +26,18 @@ import (
 const protocolVersion = 1
 
 const (
-	continuityBriefVersion  = 1
-	continuityBriefFilename = "continuity-brief.json"
+	continuityBriefVersion    = 1
+	continuityBriefFilename   = "continuity-brief.json"
+	continuityCaptureFilename = "continuity-capture.json"
+)
+
+var (
+	errMalformedContinuityCaptureReceipt = errors.New("Continuity capture receipt is malformed")
+	// The production adapter returns this only with concrete proof that attach
+	// did not persist: before command launch or after Entire's disabled guard.
+	// Any other missing success result is ambiguous.
+	errAttachmentKnownNotPersisted = errors.New("Entire attachment is known not to have persisted")
+	errAttachmentOutcomeUnknown    = errors.New("Entire attachment outcome is unknown")
 )
 
 type capabilities struct {
@@ -80,21 +91,43 @@ type journalEvent struct {
 	Timestamp         string `json:"timestamp"`
 	// Prompt is accepted only to migrate legacy journals. New journal entries
 	// must use PromptDigest, which is deliberately non-reversible.
-	Prompt          string           `json:"prompt,omitempty"`
-	PromptDigest    string           `json:"prompt_digest,omitempty"`
-	Model           string           `json:"model,omitempty"`
-	Modified        []string         `json:"modified_files,omitempty"`
-	New             []string         `json:"new_files,omitempty"`
-	Deleted         []string         `json:"deleted_files,omitempty"`
-	TestEvidence    []testEvidence   `json:"test_evidence,omitempty"`
-	Outcome         string           `json:"outcome,omitempty"`
-	DurationMS      int64            `json:"duration_ms,omitempty"`
-	ExitCode        *int             `json:"exit_code,omitempty"`
-	FailureKind     string           `json:"failure_kind,omitempty"`
-	ContinuityBrief *continuityBrief `json:"continuity_brief,omitempty"`
+	Prompt            string             `json:"prompt,omitempty"`
+	PromptDigest      string             `json:"prompt_digest,omitempty"`
+	Model             string             `json:"model,omitempty"`
+	Modified          []string           `json:"modified_files,omitempty"`
+	New               []string           `json:"new_files,omitempty"`
+	Deleted           []string           `json:"deleted_files,omitempty"`
+	TestEvidence      []testEvidence     `json:"test_evidence,omitempty"`
+	Outcome           string             `json:"outcome,omitempty"`
+	DurationMS        int64              `json:"duration_ms,omitempty"`
+	ExitCode          *int               `json:"exit_code,omitempty"`
+	FailureKind       string             `json:"failure_kind,omitempty"`
+	ContinuityBrief   *continuityBrief   `json:"continuity_brief,omitempty"`
+	ContinuityCapture *continuityCapture `json:"continuity_capture,omitempty"`
 	// Error is accepted only to migrate legacy journals. It is never emitted
 	// because tool errors can contain prompt, response, or credential data.
 	Error string `json:"error,omitempty"`
+}
+
+// continuityCapture is the redaction-invariant carrier binding. Its values are
+// structural IDs (not secret payloads) and use *_id JSON keys so Entire's
+// transcript redactor preserves them. The human-readable Continuity Brief is
+// intentionally separate: Entire may further redact its prose before restore.
+type continuityCapture struct {
+	SourceSessionID      string `json:"source_session_id"`
+	SourceBriefPayloadID string `json:"source_brief_payload_id"`
+	SourceEvidenceID     string `json:"source_evidence_id"`
+}
+
+// continuityCaptureReceipt is private local retry state. The carrier journal
+// itself is the durable, checkpoint-restorable artifact; this receipt merely
+// prevents an already successful explicit publication from being replayed.
+type continuityCaptureReceipt struct {
+	SchemaVersion    int    `json:"schema_version"`
+	SourceSessionID  string `json:"source_session_id"`
+	CarrierSessionID string `json:"carrier_session_id"`
+	BriefDigest      string `json:"brief_digest"`
+	PublicationState string `json:"publication_state"`
 }
 
 // testEvidence deliberately records only a non-reversible command fingerprint
@@ -133,15 +166,16 @@ type continuityEvidence struct {
 // stored beside the isolated session for direct recovery and embedded in the
 // append-only journal milestone so Entire can retain it with the session.
 type continuityBrief struct {
-	SchemaVersion   int                `json:"schema_version"`
-	SessionID       string             `json:"session_id"`
-	CreatedAt       string             `json:"created_at"`
-	Goal            string             `json:"goal"`
-	VerifiedOutcome string             `json:"verified_outcome"`
-	Evidence        continuityEvidence `json:"evidence"`
-	Assumptions     []string           `json:"assumptions"`
-	Failures        []string           `json:"failures"`
-	OpenRisks       []string           `json:"open_risks"`
+	SchemaVersion      int                `json:"schema_version"`
+	SessionID          string             `json:"session_id"`
+	MilestoneSessionID string             `json:"milestone_session_id,omitempty"`
+	CreatedAt          string             `json:"created_at"`
+	Goal               string             `json:"goal"`
+	VerifiedOutcome    string             `json:"verified_outcome"`
+	Evidence           continuityEvidence `json:"evidence"`
+	Assumptions        []string           `json:"assumptions"`
+	Failures           []string           `json:"failures"`
+	OpenRisks          []string           `json:"open_risks"`
 }
 
 type stringList []string
@@ -254,8 +288,14 @@ func validateSessionName(name string) error {
 	if name == "" {
 		return errors.New("session-id is required")
 	}
-	if name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\\`) {
+	if name == "." || name == ".." || filepath.Base(name) != name || filepath.IsAbs(name) || filepath.VolumeName(name) != "" || strings.HasPrefix(name, "-") || strings.ContainsAny(name, `/\\:*?[`) {
 		return errors.New("session name must not contain path separators")
+	}
+	// Session names become both filesystem components and identity fields in a
+	// Continuity Brief. Do not let the privacy boundary trim, truncate, or
+	// redact them after a source journal has already been created.
+	if redactText(name, 128) != name {
+		return errors.New("session name must be a stable, redacted-safe label of at most 128 characters")
 	}
 	return nil
 }
@@ -737,6 +777,7 @@ func redactDecision(value string) string {
 func sanitizeContinuityBrief(brief continuityBrief) continuityBrief {
 	brief.SchemaVersion = continuityBriefVersion
 	brief.SessionID = redactText(brief.SessionID, 128)
+	brief.MilestoneSessionID = redactText(brief.MilestoneSessionID, 128)
 	brief.CreatedAt = redactText(brief.CreatedAt, 64)
 	brief.Goal = redactDecision(brief.Goal)
 	brief.VerifiedOutcome = safeVerifiedOutcome(brief.VerifiedOutcome)
@@ -758,6 +799,17 @@ func sanitizeContinuityBrief(brief continuityBrief) continuityBrief {
 	brief.Failures = sanitizeDecisions(brief.Failures)
 	brief.OpenRisks = sanitizeDecisions(brief.OpenRisks)
 	return brief
+}
+
+func sanitizeContinuityCapture(capture continuityCapture) continuityCapture {
+	capture.SourceSessionID = redactText(capture.SourceSessionID, 128)
+	if !sha256Digest.MatchString(capture.SourceBriefPayloadID) {
+		capture.SourceBriefPayloadID = contentDigest(capture.SourceBriefPayloadID)
+	}
+	if !sha256Digest.MatchString(capture.SourceEvidenceID) {
+		capture.SourceEvidenceID = contentDigest(capture.SourceEvidenceID)
+	}
+	return capture
 }
 
 func sanitizeDecisions(values []string) []string {
@@ -797,6 +849,10 @@ func sanitizeJournalEvent(event journalEvent) journalEvent {
 	if event.ContinuityBrief != nil {
 		brief := sanitizeContinuityBrief(*event.ContinuityBrief)
 		event.ContinuityBrief = &brief
+	}
+	if event.ContinuityCapture != nil {
+		capture := sanitizeContinuityCapture(*event.ContinuityCapture)
+		event.ContinuityCapture = &capture
 	}
 	return event
 }
@@ -930,10 +986,194 @@ func writePrivateFile(path string, data []byte) error {
 	return f.Sync()
 }
 
-// Checkpoint records an explicit, decision-rich Continuity Brief. The brief
-// is written locally for recovery and embedded in the append-only journal so
-// Entire captures it as part of the external-agent session transcript.
+// entireCheckpointPublisher is the one true-external seam in checkpoint
+// capture. Filesystem operations remain local implementation details; Entire
+// is deliberately isolated here so a fake can exercise publication failures
+// without pretending that a hook notification proves persistence.
+type entireCheckpointPublisher interface {
+	Attach(context.Context, string, string) error
+	FindAttached(context.Context, string, string) (bool, error)
+}
+
+type entireCLIAdapter struct {
+	stderr io.Writer
+}
+
+func (adapter entireCLIAdapter) Attach(ctx context.Context, root, sessionID string) error {
+	bin, err := exec.LookPath("entire")
+	if err != nil {
+		return fmt.Errorf("%w: Entire is enabled for Aider but the `entire` command is not on PATH", errAttachmentKnownNotPersisted)
+	}
+	// Attach is the supported persistence operation for an explicit milestone.
+	// Do not pass --force: Entire may otherwise amend the developer's commit.
+	// Entire probes the controlling TTY rather than only child stdin, so its
+	// documented Git noninteractive sentinel is also required to force the
+	// manual-trailer path and prevent an amend prompt in a developer terminal.
+	cmd := exec.CommandContext(ctx, bin, "session", "attach", sessionID, "--agent", "aider")
+	cmd.Dir = root
+	cmd.Stdin = strings.NewReader("")
+	cmd.Env = entireNonInteractiveEnv(os.Environ())
+	// Entire prints a safe, manual `Entire-Checkpoint` trailer to stdout when
+	// noninteractive mode prevents it from amending HEAD. Capture it so the
+	// machine-readable Continuity Brief remains this command's only stdout.
+	var attachOutput bytes.Buffer
+	cmd.Stdout = &attachOutput
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("%w: Entire attachment timed out", errAttachmentOutcomeUnknown)
+		}
+		// An exit status cannot prove whether Entire wrote its checkpoint before
+		// returning. Treat every started command without an affirmative success
+		// result as ambiguous so a retry cannot create a duplicate checkpoint.
+		return fmt.Errorf("%w: Entire attachment ended without a confirmed completion", errAttachmentOutcomeUnknown)
+	}
+	if !entireOutputHasLine(attachOutput.Bytes(), "Attached session "+sessionID) {
+		if entireOutputHasLine(attachOutput.Bytes(), entireDisabledMessage) {
+			// `entire disable` deliberately leaves hooks/agent markers installed,
+			// and attach exits zero after this guard. It has not started a write,
+			// so this is the one safe post-command path back to `prepared`.
+			return fmt.Errorf("%w: Entire is disabled; run `entire enable` before retrying", errAttachmentKnownNotPersisted)
+		}
+		// A zero exit alone is not a persistence acknowledgement. In particular,
+		// it must not turn an unexpected CLI response into an attached receipt.
+		return fmt.Errorf("%w: Entire attachment exited without its expected confirmation", errAttachmentOutcomeUnknown)
+	}
+	stderr := adapter.stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	fmt.Fprintf(stderr, "Entire stored the redacted Aider recovery session. Resume it with:\n\n  aider-entire --resume %s\n", sessionID)
+	writeEntireCheckpointTrailers(stderr, attachOutput.Bytes())
+	return nil
+}
+
+// FindAttached looks for positive proof of an interrupted publication. The
+// local session state is the normal noninteractive attach record; the branch
+// list is a secondary proof after a developer has linked its checkpoint.
+// Neither an absent state nor an empty, bounded list proves that attach did
+// not happen, so callers must treat false as unknown rather than retrying.
+func (entireCLIAdapter) FindAttached(ctx context.Context, root, sessionID string) (bool, error) {
+	bin, err := exec.LookPath("entire")
+	if err != nil {
+		return false, errors.New("Entire is enabled for Aider but the `entire` command is not on PATH")
+	}
+
+	var infoOutput bytes.Buffer
+	infoCmd := exec.CommandContext(ctx, bin, "session", "info", sessionID, "--json")
+	infoCmd.Dir = root
+	infoCmd.Stdin = strings.NewReader("")
+	infoCmd.Env = entireNonInteractiveEnv(os.Environ())
+	infoCmd.Stdout = &infoOutput
+	infoCmd.Stderr = io.Discard
+	if err := infoCmd.Run(); err == nil {
+		var state struct {
+			SessionID      string `json:"session_id"`
+			LastCheckpoint string `json:"last_checkpoint_id"`
+		}
+		if err := decodeStrictJSON(infoOutput.Bytes(), &state); err != nil {
+			return false, fmt.Errorf("parse Entire session reconciliation data: %w", err)
+		}
+		if state.SessionID == sessionID && state.LastCheckpoint != "" {
+			return true, nil
+		}
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return false, errors.New("Entire attachment reconciliation timed out; publication state is unknown")
+	}
+
+	cmd := exec.CommandContext(ctx, bin, "checkpoint", "list", "--session", sessionID, "--json", "--no-pager")
+	cmd.Dir = root
+	cmd.Stdin = strings.NewReader("")
+	cmd.Env = entireNonInteractiveEnv(os.Environ())
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return false, errors.New("Entire attachment reconciliation timed out; publication state is unknown")
+		}
+		return false, errors.New("could not reconcile the Aider carrier against Entire session state or checkpoints")
+	}
+	var checkpoints []struct {
+		SessionID  string   `json:"session_id"`
+		SessionIDs []string `json:"session_ids"`
+	}
+	if err := decodeStrictJSON(output.Bytes(), &checkpoints); err != nil {
+		return false, fmt.Errorf("parse Entire checkpoint reconciliation data: %w", err)
+	}
+	for _, checkpoint := range checkpoints {
+		if checkpoint.SessionID == sessionID || stringSliceContains(checkpoint.SessionIDs, sessionID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+var entireCheckpointTrailerLine = regexp.MustCompile(`(?m)^[ \t]*Entire-Checkpoint:[ \t]*([0-9a-f]{12}|[0-9ABCDEFGHJKMNPQRSTVWXYZ]{26})[ \t]*\r?$`)
+
+const entireDisabledMessage = "Entire is disabled. Run `entire enable` to re-enable."
+
+// entireOutputHasLine deliberately accepts only an exact, complete output
+// line. Entire's attach output is otherwise untrusted human-readable text and
+// must not be mistaken for a persistence confirmation.
+func entireOutputHasLine(output []byte, wanted string) bool {
+	for _, line := range bytes.Split(output, []byte("\n")) {
+		if strings.TrimSpace(string(line)) == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceContains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// writeEntireCheckpointTrailers forwards only a validated trailer from
+// Entire's otherwise untrusted human-readable output. This keeps raw prompts
+// and arbitrary child output out of the launcher while making the manual
+// recovery step visible to the developer.
+func writeEntireCheckpointTrailers(stderr io.Writer, output []byte) {
+	matches := entireCheckpointTrailerLine.FindAllSubmatch(output, -1)
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		checkpointID := string(match[1])
+		if _, duplicate := seen[checkpointID]; duplicate {
+			continue
+		}
+		seen[checkpointID] = struct{}{}
+		fmt.Fprintln(stderr, "Entire stored the redacted Aider milestone without amending HEAD. Add this trailer to a commit before relying on recovery:")
+		fmt.Fprintf(stderr, "\n  Entire-Checkpoint: %s\n", checkpointID)
+	}
+}
+
+func entireNonInteractiveEnv(env []string) []string {
+	result := append([]string(nil), env...)
+	for i, entry := range result {
+		key, _, found := strings.Cut(entry, "=")
+		if found && strings.EqualFold(key, "GIT_TERMINAL_PROMPT") {
+			result[i] = "GIT_TERMINAL_PROMPT=0"
+			return result
+		}
+	}
+	return append(result, "GIT_TERMINAL_PROMPT=0")
+}
+
+// Checkpoint records an explicit, decision-rich Continuity Brief. The source
+// journal keeps the local recovery record. When Entire is enabled, a separate
+// redacted carrier session is attached through Entire's real attach command;
+// it is never represented as a synthetic Aider turn-end event.
 func Checkpoint(args []string, stdout io.Writer) error {
+	return checkpointWithPublisher(args, stdout, entireCLIAdapter{})
+}
+
+func checkpointWithPublisher(args []string, stdout io.Writer, publisher entireCheckpointPublisher) error {
 	fs := flags("checkpoint", args)
 	repo := fs.String("repo", "", "repository path")
 	sessionID := fs.String("session", "", "Aider Session name")
@@ -959,10 +1199,10 @@ func Checkpoint(args []string, stdout io.Writer) error {
 	}
 	briefPath := filepath.Join(dir, continuityBriefFilename)
 	if _, err := os.Lstat(briefPath); err == nil {
-		// A prior attempt can have attached the local brief and milestone but
-		// failed while notifying Entire. Validate that durable state, then retry
-		// only the supported checkpoint notification. This never launches Aider,
-		// changes source files, or appends a duplicate milestone.
+		// A prior explicit attempt can have created durable local state and then
+		// failed during Entire publication. Validate it, then retry only the
+		// carrier attachment. This never launches Aider, edits code, or appends
+		// a duplicate milestone.
 		briefData, err := readContinuityBrief(root, *sessionID)
 		if err != nil {
 			return err
@@ -971,7 +1211,7 @@ func Checkpoint(args []string, stdout io.Writer) error {
 		if err := decodeStrictJSON(briefData, &brief); err != nil {
 			return err
 		}
-		if err := notifyCheckpointMilestone(root, journal, brief); err != nil {
+		if err := publishContinuityMilestone(context.Background(), root, *sessionID, briefData, publisher); err != nil {
 			return err
 		}
 		_, err = stdout.Write(briefData)
@@ -1012,14 +1252,391 @@ func Checkpoint(args []string, stdout io.Writer) error {
 		}
 		return err
 	}
-	if err := notifyCheckpointMilestone(root, journal, brief); err != nil {
-		// The milestone and its sidecar are now a complete, recoverable local
-		// checkpoint. Leave them intact so a later identical `checkpoint`
-		// command can retry only the Entire notification.
+	if err := publishContinuityMilestone(context.Background(), root, *sessionID, briefData, publisher); err != nil {
+		// The milestone and its sidecar are complete local recovery state. Leave
+		// them intact so a later explicit checkpoint command can retry only the
+		// real Entire attach operation.
 		return err
 	}
 	_, err = stdout.Write(briefData)
 	return err
+}
+
+func entireEnabled(root string) (bool, error) {
+	_, err := os.Stat(markerPath(root))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func continuityBriefDigest(data []byte) string {
+	return contentDigest(string(data))
+}
+
+// continuityBriefPayloadID identifies the source Brief excluding its carrier
+// ID. Omitting that self-reference makes the ID stable for both newly-created
+// and legacy Briefs.
+func continuityBriefPayloadID(brief continuityBrief) string {
+	brief.MilestoneSessionID = ""
+	data, err := json.Marshal(sanitizeContinuityBrief(brief))
+	if err != nil {
+		return contentDigest("unencodable-continuity-brief")
+	}
+	return continuityBriefDigest(data)
+}
+
+func continuityCaptureForBrief(brief continuityBrief) continuityCapture {
+	brief = sanitizeContinuityBrief(brief)
+	return continuityCapture{
+		SourceSessionID:      brief.SessionID,
+		SourceBriefPayloadID: continuityBriefPayloadID(brief),
+		SourceEvidenceID:     brief.Evidence.IntegrityDigest,
+	}
+}
+
+// continuityCarrierIDForCapture derives the carrier path from the
+// redaction-invariant binding manifest rather than prose that Entire may
+// redact before it persists the carrier.
+func continuityCarrierIDForCapture(capture continuityCapture) string {
+	capture = sanitizeContinuityCapture(capture)
+	binding := capture.SourceSessionID + "\n" + capture.SourceBriefPayloadID + "\n" + capture.SourceEvidenceID
+	digest := strings.TrimPrefix(contentDigest(binding), "sha256:")
+	return "aider-milestone-" + digest[:32]
+}
+
+func continuityCarrierIDForBrief(brief continuityBrief) string {
+	return continuityCarrierIDForCapture(continuityCaptureForBrief(brief))
+}
+
+func continuityCarrierID(briefData []byte) string {
+	var brief continuityBrief
+	if err := decodeStrictJSON(briefData, &brief); err == nil {
+		return continuityCarrierIDForBrief(brief)
+	}
+	// Callers validate canonical Brief data before trusting the result. This
+	// fallback preserves a deterministic error-path identifier without making
+	// malformed input a recoverable carrier.
+	digest := strings.TrimPrefix(continuityBriefDigest(briefData), "sha256:")
+	return "aider-milestone-" + digest[:32]
+}
+
+func publishContinuityMilestone(ctx context.Context, root, sourceSessionID string, briefData []byte, publisher entireCheckpointPublisher) error {
+	enabled, err := entireEnabled(root)
+	if err != nil || !enabled {
+		return err
+	}
+	var brief continuityBrief
+	if err := decodeStrictJSON(briefData, &brief); err != nil {
+		return fmt.Errorf("parse Continuity Brief before publication: %w", err)
+	}
+	canonicalBrief := sanitizeContinuityBrief(brief)
+	canonicalData, err := json.Marshal(canonicalBrief)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(briefData, canonicalData) {
+		return errors.New("Continuity Brief is not canonical redacted data")
+	}
+	if canonicalBrief.SessionID != sourceSessionID {
+		return errors.New("Continuity Brief does not belong to the requested Aider Session")
+	}
+
+	capture := continuityCaptureForBrief(canonicalBrief)
+	carrierID := continuityCarrierIDForCapture(capture)
+	// Schema-1 Briefs created before carrier IDs were embedded must remain
+	// publishable. New Briefs always declare the ID; a present value is a
+	// mandatory content-addressed binding rather than an optional hint.
+	if canonicalBrief.MilestoneSessionID != "" && canonicalBrief.MilestoneSessionID != carrierID {
+		return errors.New("Continuity Brief does not declare its expected milestone carrier")
+	}
+	receiptPath := filepath.Join(sessionDir(root), sourceSessionID, continuityCaptureFilename)
+	carrierExists, err := continuityCarrierExists(root, carrierID)
+	if err != nil {
+		return err
+	}
+	expected := continuityCaptureReceipt{
+		SchemaVersion:    continuityBriefVersion,
+		SourceSessionID:  sourceSessionID,
+		CarrierSessionID: carrierID,
+		BriefDigest:      capture.SourceBriefPayloadID,
+	}
+	receipt, exists, err := readContinuityCaptureReceipt(receiptPath)
+	if err != nil {
+		if !errors.Is(err, errMalformedContinuityCaptureReceipt) {
+			return err
+		}
+		if carrierExists {
+			return reconcileUncertainContinuityAttachment(ctx, root, carrierID, receiptPath, expected, publisher, "the local publication receipt is malformed")
+		}
+		receipt = expected
+		receipt.PublicationState = "prepared"
+		if err := writeContinuityCaptureReceipt(receiptPath, receipt); err != nil {
+			return err
+		}
+	} else if !exists {
+		if carrierExists {
+			return reconcileUncertainContinuityAttachment(ctx, root, carrierID, receiptPath, expected, publisher, "the local publication receipt is missing")
+		}
+		receipt = expected
+		receipt.PublicationState = "prepared"
+		if err := writeContinuityCaptureReceipt(receiptPath, receipt); err != nil {
+			return err
+		}
+	} else {
+		if receipt.SchemaVersion != expected.SchemaVersion || receipt.SourceSessionID != expected.SourceSessionID || receipt.CarrierSessionID != expected.CarrierSessionID || receipt.BriefDigest != expected.BriefDigest {
+			return errors.New("Continuity capture receipt does not match the requested milestone")
+		}
+		if receipt.PublicationState == "attached" {
+			if _, err := ensureContinuityCarrier(root, carrierID, canonicalBrief, capture); err != nil {
+				return err
+			}
+			return nil
+		}
+		if receipt.PublicationState == "attaching" {
+			return reconcileUncertainContinuityAttachment(ctx, root, carrierID, receiptPath, expected, publisher, "the previous Entire attachment did not record a final result")
+		}
+		if receipt.PublicationState != "prepared" {
+			return errors.New("Continuity capture receipt has an invalid publication state")
+		}
+	}
+	if _, err := ensureContinuityCarrier(root, carrierID, canonicalBrief, capture); err != nil {
+		return err
+	}
+
+	attachCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	receipt.PublicationState = "attaching"
+	if err := writeContinuityCaptureReceipt(receiptPath, receipt); err != nil {
+		return err
+	}
+	if err := publisher.Attach(attachCtx, root, carrierID); err != nil {
+		if errors.Is(err, errAttachmentKnownNotPersisted) {
+			// This narrow outcome requires proof that Entire never persisted the
+			// carrier (for example, command lookup failed or Entire is disabled).
+			// It is safe to put the receipt back into `prepared`; every other error
+			// must reconcile or fail closed.
+			receipt.PublicationState = "prepared"
+			if receiptErr := writeContinuityCaptureReceipt(receiptPath, receipt); receiptErr != nil {
+				return fmt.Errorf("Entire attachment failed and its retry state could not be saved: %w", receiptErr)
+			}
+			return fmt.Errorf("Continuity Brief is ready locally but publication to Entire is pending; rerun checkpoint explicitly: %w", err)
+		}
+		return reconcileUncertainContinuityAttachment(ctx, root, carrierID, receiptPath, expected, publisher, "Entire did not report a confirmed attachment result")
+	}
+	receipt.PublicationState = "attached"
+	if err := writeContinuityCaptureReceipt(receiptPath, receipt); err != nil {
+		// Entire may already have persisted a checkpoint. Leave `attaching` as
+		// the conservative durable state; the next explicit command will query
+		// Entire and never blindly create a second checkpoint.
+		return fmt.Errorf("Entire attached the Continuity Brief but the local publication receipt could not be saved; rerun checkpoint to reconcile without a duplicate attach: %w", err)
+	}
+	return nil
+}
+
+// reconcileUncertainContinuityAttachment never turns an ambiguous prior attach
+// into another attach. Entire does not accept a caller-supplied checkpoint ID;
+// a second attach after a crash can therefore create a second checkpoint.
+func reconcileUncertainContinuityAttachment(ctx context.Context, root, carrierID, receiptPath string, expected continuityCaptureReceipt, publisher entireCheckpointPublisher, reason string) error {
+	reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	attached, err := publisher.FindAttached(reconcileCtx, root, carrierID)
+	if err != nil {
+		return fmt.Errorf("Continuity publication state is unknown because %s and Entire reconciliation failed; do not retry attach automatically: %w", reason, err)
+	}
+	if !attached {
+		return fmt.Errorf("Continuity publication state is unknown because %s; no matching Entire checkpoint was proven, so attach was not retried automatically", reason)
+	}
+	expected.PublicationState = "attached"
+	if err := writeContinuityCaptureReceipt(receiptPath, expected); err != nil {
+		return fmt.Errorf("Entire checkpoint was reconciled but the local publication receipt could not be saved: %w", err)
+	}
+	return nil
+}
+
+func continuityCarrierExists(root, carrierID string) (bool, error) {
+	info, err := os.Lstat(filepath.Join(sessionDir(root), carrierID))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("Continuity carrier directory is not a private directory")
+	}
+	return true, nil
+}
+
+func ensureContinuityCarrier(root, carrierID string, brief continuityBrief, capture continuityCapture) (bool, error) {
+	if err := validateSessionName(carrierID); err != nil {
+		return false, err
+	}
+	dir := filepath.Join(sessionDir(root), carrierID)
+	if _, err := os.Lstat(dir); err == nil {
+		stored, err := readCanonicalContinuityBrief(root, carrierID)
+		if err != nil {
+			return false, fmt.Errorf("validate existing Continuity carrier: %w", err)
+		}
+		storedCapture, err := validateContinuityCarrier(carrierID, stored.Attached.Event, stored.Brief)
+		if err != nil {
+			return false, fmt.Errorf("validate existing Continuity carrier: %w", err)
+		}
+		if storedCapture != sanitizeContinuityCapture(capture) {
+			return false, errors.New("existing Continuity carrier does not match the requested binding manifest")
+		}
+		// Entire may have redacted the carrier's human-readable Brief prose after
+		// attach. The matching manifest proves this is the same carrier without
+		// falsely rejecting a safe redacted restore for a byte mismatch.
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := os.MkdirAll(sessionDir(root), 0700); err != nil {
+		return false, err
+	}
+	if err := os.Chmod(sessionDir(root), 0700); err != nil {
+		return false, err
+	}
+	temporaryDir, err := os.MkdirTemp(sessionDir(root), ".aider-milestone-")
+	if err != nil {
+		return false, err
+	}
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.RemoveAll(temporaryDir)
+		}
+	}()
+	if err := os.Chmod(temporaryDir, 0700); err != nil {
+		return false, err
+	}
+	journal := filepath.Join(temporaryDir, "events.jsonl")
+	finalJournal := filepath.Join(dir, "events.jsonl")
+	events := []journalEvent{
+		{
+			Event:      "session-start",
+			SessionID:  carrierID,
+			SessionRef: finalJournal,
+			RepoPath:   root,
+			Timestamp:  brief.CreatedAt,
+			Outcome:    "running",
+		},
+		{
+			Event:             "checkpoint-milestone",
+			SessionID:         carrierID,
+			PreviousSessionID: brief.SessionID,
+			SessionRef:        finalJournal,
+			RepoPath:          root,
+			Timestamp:         brief.CreatedAt,
+			Outcome:           brief.VerifiedOutcome,
+			ContinuityBrief:   &brief,
+			ContinuityCapture: &capture,
+		},
+		{
+			Event:      "session-end",
+			SessionID:  carrierID,
+			SessionRef: finalJournal,
+			RepoPath:   root,
+			Timestamp:  brief.CreatedAt,
+			Outcome:    brief.VerifiedOutcome,
+		},
+	}
+	data, err := encodeJournalEvents(events)
+	if err != nil {
+		return false, err
+	}
+	if err := writePrivateFile(journal, data); err != nil {
+		return false, err
+	}
+	if err := os.Rename(temporaryDir, dir); err != nil {
+		if os.IsExist(err) {
+			return ensureContinuityCarrier(root, carrierID, brief, capture)
+		}
+		return false, err
+	}
+	removeTemporary = false
+	return true, nil
+}
+
+func readContinuityCaptureReceipt(path string) (continuityCaptureReceipt, bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return continuityCaptureReceipt{}, false, nil
+	}
+	if err != nil {
+		return continuityCaptureReceipt{}, false, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return continuityCaptureReceipt{}, false, errors.New("Continuity capture receipt is not a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return continuityCaptureReceipt{}, false, err
+	}
+	var receipt continuityCaptureReceipt
+	if err := decodeStrictJSON(data, &receipt); err != nil {
+		return continuityCaptureReceipt{}, false, fmt.Errorf("%w: parse: %v", errMalformedContinuityCaptureReceipt, err)
+	}
+	canonical, err := json.Marshal(receipt)
+	if err != nil {
+		return continuityCaptureReceipt{}, false, err
+	}
+	if !bytes.Equal(data, canonical) {
+		return continuityCaptureReceipt{}, false, fmt.Errorf("%w: not canonical data", errMalformedContinuityCaptureReceipt)
+	}
+	return receipt, true, nil
+}
+
+func writeContinuityCaptureReceipt(path string, receipt continuityCaptureReceipt) error {
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("Continuity capture receipt is not a regular file")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	// A receipt is recoverable state, but writing it atomically avoids turning a
+	// successful Entire attachment into a permanently malformed retry record.
+	file, err := os.CreateTemp(filepath.Dir(path), ".continuity-capture-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := file.Name()
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := file.Chmod(0600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	removeTemporary = false
+	return nil
 }
 
 // Resume intentionally performs no Aider launch and no filesystem mutation.
@@ -1188,7 +1805,9 @@ func buildContinuityBrief(sessionID string, events []journalEvent, decision cont
 		Failures:    decision.Failures,
 		OpenRisks:   decision.OpenRisks,
 	}
-	return sanitizeContinuityBrief(brief), nil
+	brief = sanitizeContinuityBrief(brief)
+	brief.MilestoneSessionID = continuityCarrierIDForBrief(brief)
+	return brief, nil
 }
 
 // continuityEvidenceDigest deliberately excludes workstation-local references.
@@ -1209,34 +1828,62 @@ func continuityEvidenceDigest(events []journalEvent) string {
 	return contentDigest(string(bytes.Join(lines, []byte("\n"))))
 }
 
-func readContinuityBrief(root, sessionID string) ([]byte, error) {
+type canonicalContinuityBrief struct {
+	Data     []byte
+	Brief    continuityBrief
+	Attached attachedContinuityBrief
+}
+
+// readCanonicalContinuityBrief reads only the embedded milestone artifact. It
+// deliberately does not inspect a launcher-local sidecar: Entire restores the
+// journal, not private sidecars, and callers need the attached event's binding
+// manifest to distinguish a carrier from its source session.
+func readCanonicalContinuityBrief(root, sessionID string) (canonicalContinuityBrief, error) {
 	_, _, journalData, _, err := readCanonicalSession(root, sessionID)
 	if err != nil {
-		return nil, err
+		return canonicalContinuityBrief{}, err
 	}
-	embedded, prefixDigest, err := latestAttachedBrief(journalData)
+	attached, err := latestAttachedBrief(journalData)
 	if err != nil {
-		return nil, err
+		return canonicalContinuityBrief{}, err
 	}
 	var embeddedBrief continuityBrief
-	if err := decodeStrictJSON(embedded, &embeddedBrief); err != nil {
-		return nil, fmt.Errorf("parse embedded Continuity Brief: %w", err)
+	if err := decodeStrictJSON(attached.Data, &embeddedBrief); err != nil {
+		return canonicalContinuityBrief{}, fmt.Errorf("parse embedded Continuity Brief: %w", err)
 	}
 	canonicalBrief := sanitizeContinuityBrief(embeddedBrief)
 	canonical, err := json.Marshal(canonicalBrief)
 	if err != nil {
+		return canonicalContinuityBrief{}, err
+	}
+	if !bytes.Equal(attached.Data, canonical) {
+		return canonicalContinuityBrief{}, errors.New("embedded Continuity Brief is not canonical redacted data")
+	}
+	return canonicalContinuityBrief{Data: canonical, Brief: canonicalBrief, Attached: attached}, nil
+}
+
+func readContinuityBrief(root, sessionID string) ([]byte, error) {
+	canonical, err := readCanonicalContinuityBrief(root, sessionID)
+	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(embedded, canonical) {
-		return nil, errors.New("embedded Continuity Brief is not canonical redacted data")
+
+	if canonical.Attached.Event.ContinuityCapture != nil {
+		if _, err := validateContinuityCarrier(sessionID, canonical.Attached.Event, canonical.Brief); err != nil {
+			return nil, err
+		}
+		// A carrier is intentionally a tiny redacted transport transcript, not
+		// the source journal. Its receipt binds the Brief to the source evidence;
+		// comparing its prefix to source evidence would be a false guarantee.
+		return canonical.Data, nil
 	}
-	if canonicalBrief.SessionID != sessionID {
+	if canonical.Brief.SessionID != sessionID {
 		return nil, errors.New("Continuity Brief does not belong to the requested Aider Session")
 	}
-	if canonicalBrief.Goal == "" {
+	if canonical.Brief.Goal == "" {
 		return nil, errors.New("Continuity Brief has no goal")
 	}
-	if canonicalBrief.Evidence.IntegrityDigest != prefixDigest {
+	if canonical.Brief.Evidence.IntegrityDigest != canonical.Attached.PrefixDigest {
 		return nil, errors.New("Continuity Brief integrity digest does not match its journal evidence")
 	}
 
@@ -1246,7 +1893,7 @@ func readContinuityBrief(root, sessionID string) ([]byte, error) {
 	path := filepath.Join(sessionDir(root), sessionID, continuityBriefFilename)
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
-		return canonical, nil
+		return canonical.Data, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("Continuity Brief: %w", err)
@@ -1270,15 +1917,53 @@ func readContinuityBrief(root, sessionID string) ([]byte, error) {
 	if !bytes.Equal(data, sidecarData) {
 		return nil, errors.New("Continuity Brief is not canonical redacted data")
 	}
-	if !bytes.Equal(sidecarData, canonical) {
+	if !bytes.Equal(sidecarData, canonical.Data) {
 		return nil, errors.New("Continuity Brief sidecar does not match the canonical journal milestone")
 	}
-	return canonical, nil
+	return canonical.Data, nil
 }
 
-func latestAttachedBrief(journalData []byte) ([]byte, string, error) {
-	var latest []byte
-	var latestDigest string
+func validateContinuityCarrier(carrierID string, event journalEvent, brief continuityBrief) (continuityCapture, error) {
+	capture := event.ContinuityCapture
+	if capture == nil {
+		return continuityCapture{}, errors.New("Continuity carrier is missing its capture receipt")
+	}
+	if event.SessionID != carrierID {
+		return continuityCapture{}, errors.New("Continuity carrier event does not belong to the requested session")
+	}
+	if brief.MilestoneSessionID != "" && brief.MilestoneSessionID != carrierID {
+		return continuityCapture{}, errors.New("Continuity carrier session ID does not match the embedded Brief")
+	}
+	if brief.Goal == "" {
+		return continuityCapture{}, errors.New("Continuity Brief has no goal")
+	}
+	if event.PreviousSessionID == "" || event.PreviousSessionID != brief.SessionID {
+		return continuityCapture{}, errors.New("Continuity carrier does not link to its source Aider Session")
+	}
+	if capture.SourceSessionID != brief.SessionID {
+		return continuityCapture{}, errors.New("Continuity carrier receipt does not match the source Aider Session")
+	}
+	if !sha256Digest.MatchString(capture.SourceBriefPayloadID) || !sha256Digest.MatchString(capture.SourceEvidenceID) {
+		return continuityCapture{}, errors.New("Continuity carrier receipt has invalid integrity digests")
+	}
+	if continuityCarrierIDForCapture(*capture) != carrierID {
+		return continuityCapture{}, errors.New("Continuity carrier session ID does not match its binding manifest")
+	}
+	// Entire redacts the persisted carrier after this launcher creates it. The
+	// manifest above authenticates carrier identity and source evidence, while
+	// the human-readable Brief prose is deliberately accepted as redacted
+	// advisory content rather than compared byte-for-byte to pre-attach data.
+	return sanitizeContinuityCapture(*capture), nil
+}
+
+type attachedContinuityBrief struct {
+	Data         []byte
+	PrefixDigest string
+	Event        journalEvent
+}
+
+func latestAttachedBrief(journalData []byte) (attachedContinuityBrief, error) {
+	var latest attachedContinuityBrief
 	var prior []journalEvent
 	for _, line := range bytes.SplitAfter(journalData, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)
@@ -1287,22 +1972,21 @@ func latestAttachedBrief(journalData []byte) ([]byte, string, error) {
 		}
 		var event journalEvent
 		if err := json.Unmarshal(trimmed, &event); err != nil {
-			return nil, "", fmt.Errorf("parse canonical journal milestone: %w", err)
+			return attachedContinuityBrief{}, fmt.Errorf("parse canonical journal milestone: %w", err)
 		}
 		if event.Event == "checkpoint-milestone" && event.ContinuityBrief != nil {
 			brief, err := json.Marshal(sanitizeContinuityBrief(*event.ContinuityBrief))
 			if err != nil {
-				return nil, "", err
+				return attachedContinuityBrief{}, err
 			}
-			latest = brief
-			latestDigest = continuityEvidenceDigest(prior)
+			latest = attachedContinuityBrief{Data: brief, PrefixDigest: continuityEvidenceDigest(prior), Event: sanitizeJournalEvent(event)}
 		}
 		prior = append(prior, sanitizeJournalEvent(event))
 	}
-	if latest == nil {
-		return nil, "", errors.New("Continuity Brief is not attached to the canonical journal")
+	if latest.Data == nil {
+		return attachedContinuityBrief{}, errors.New("Continuity Brief is not attached to the canonical journal")
 	}
-	return latest, latestDigest, nil
+	return latest, nil
 }
 
 func decodeStrictJSON(data []byte, target any) error {
@@ -1367,7 +2051,7 @@ func Launch(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 	if *resume != "" {
-		if *name != "" || *messageFile != "" || strings.TrimSpace(*intent) != "" || *model != "" || *aiderBin != "aider" || len(testCommands) != 0 {
+		if *name != "" || *messageFile != "" || strings.TrimSpace(*intent) != "" || *model != "" || *aiderBin != "aider" || len(testCommands) != 0 || len(fs.Args()) != 0 {
 			return errors.New("--resume only retrieves a Continuity Brief; use --continue-from with an explicit --message-file to start a new Aider Session")
 		}
 		return Resume([]string{"--repo", *repo, "--resume", *resume}, stdout)
@@ -1792,22 +2476,6 @@ func appendAndNotify(repo, journal string, event journalEvent) error {
 		return err
 	}
 	return notifyEntire(repo, event)
-}
-
-// notifyCheckpointMilestone asks Entire to capture the already-appended
-// checkpoint-milestone through a supported lifecycle hook. It deliberately
-// does not append a synthetic turn-end event: the canonical transcript keeps
-// the real milestone as the authoritative handoff record.
-func notifyCheckpointMilestone(repo, journal string, brief continuityBrief) error {
-	return notifyEntire(repo, journalEvent{
-		Event:           "turn-end",
-		SessionID:       brief.SessionID,
-		SessionRef:      journal,
-		RepoPath:        repo,
-		Timestamp:       brief.CreatedAt,
-		Outcome:         brief.VerifiedOutcome,
-		ContinuityBrief: &brief,
-	})
 }
 
 func notifyEntire(repo string, event journalEvent) error {

@@ -6,9 +6,22 @@ agent_bin="${AGENT_BIN:-./entire-agent-aider}"
 launcher_bin="${LAUNCHER_BIN:-./aider-entire}"
 if [ ! -f "$agent_bin" ] && [ -f "${agent_bin}.exe" ]; then agent_bin="${agent_bin}.exe"; fi
 if [ ! -f "$launcher_bin" ] && [ -f "${launcher_bin}.exe" ]; then launcher_bin="${launcher_bin}.exe"; fi
-probe_dir="$(pwd)/.probe-aider-$$"
+probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/aider-probe.XXXXXX")"
 repo_dir="$probe_dir/repo"
 keep=0
+
+to_windows_path() {
+  if command -v wslpath >/dev/null 2>&1; then
+    wslpath -w "$1"
+    return
+  fi
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+    return
+  fi
+  printf '%s\n' 'Windows launcher verification needs wslpath or cygpath.' >&2
+  exit 1
+}
 
 cleanup() {
   [ "$keep" = 1 ] || rm -rf "$probe_dir"
@@ -33,8 +46,8 @@ fake_aider="$probe_dir/fake-aider"
 repo_arg="$repo_dir"
 if file "$launcher_bin" | grep -qi 'PE32'; then
   fake_aider="$probe_dir/fake-aider.cmd"
-  repo_arg="$(wslpath -w "$repo_dir")"
-  fake_aider="$(wslpath -w "$fake_aider")"
+  repo_arg="$(to_windows_path "$repo_dir")"
+  fake_aider="$(to_windows_path "$fake_aider")"
 fi
 
 printf 'aider binary: '
@@ -46,7 +59,7 @@ prompt_file="$probe_dir/fixture-prompt.md"
 printf '%s\n' 'fixture prompt' > "$prompt_file"
 prompt_arg="$prompt_file"
 if file "$launcher_bin" | grep -qi 'PE32'; then
-  prompt_arg="$(wslpath -w "$prompt_file")"
+  prompt_arg="$(to_windows_path "$prompt_file")"
 fi
 "$launcher_bin" --repo "$repo_arg" --name verifier --aider-bin "$fake_aider" \
   --intent 'verify fixture session' --message-file "$prompt_arg" \
@@ -61,7 +74,7 @@ decision_file="$probe_dir/continuity-decision.json"
 printf '%s\n' '{"goal":"Verify safe session recovery","assumptions":["The canonical journal is available"],"failures":[],"open_risks":["A developer must explicitly choose the next instruction"]}' > "$decision_file"
 decision_arg="$decision_file"
 if file "$launcher_bin" | grep -qi 'PE32'; then
-  decision_arg="$(wslpath -w "$decision_file")"
+  decision_arg="$(to_windows_path "$decision_file")"
 fi
 "$launcher_bin" checkpoint --repo "$repo_arg" --session verifier --brief-file "$decision_arg"
 brief="$repo_dir/.entire/aider-sessions/verifier/continuity-brief.json"

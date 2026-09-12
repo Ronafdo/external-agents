@@ -2,7 +2,10 @@ package aider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +57,25 @@ func TestInvalidProtocolDoesNotWriteStdout(t *testing.T) {
 	err := Run("parse-hook", []string{"--hook", "turn-start"}, strings.NewReader("not-json"), &out)
 	if err == nil || out.Len() != 0 {
 		t.Fatalf("err=%v stdout=%q", err, out.String())
+	}
+}
+
+func TestSessionNameMustRemainStableAcrossTheRedactionBoundary(t *testing.T) {
+	for _, name := range []string{
+		" leading-space",
+		"trailing-space ",
+		"two  spaces",
+		"gsk_session-name-must-not-be-an-identity",
+		strings.Repeat("a", 129),
+		"C:volume-relative",
+		"-looks-like-a-flag",
+	} {
+		if err := validateSessionName(name); err == nil {
+			t.Fatalf("session name %q would change at the redaction boundary", name)
+		}
+	}
+	if err := validateSessionName("checkout-fix_01"); err != nil {
+		t.Fatalf("safe session name unexpectedly rejected: %v", err)
 	}
 }
 
@@ -346,6 +368,7 @@ func TestCheckpointWritesDurableRedactedContinuityBrief(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertBriefString(t, document, "session_id", sessionID)
+	assertBriefString(t, document, "milestone_session_id", continuityCarrierID(brief))
 	assertBriefString(t, document, "goal", goal)
 	assertBriefString(t, document, "verified_outcome", "passed")
 	assertBriefStrings(t, document, "assumptions", []string{"The payment provider keeps idempotency keys for 24 hours"})
@@ -365,20 +388,31 @@ func TestCheckpointWritesDurableRedactedContinuityBrief(t *testing.T) {
 	if raw, ok := evidence["integrity_digest"]; !ok || json.Unmarshal(raw, &integrity) != nil || !strings.HasPrefix(integrity, "sha256:") {
 		t.Fatalf("continuity brief must include an evidence integrity digest: %s", brief)
 	}
+	carrierPath := filepath.Join(sessionDir(repo), continuityCarrierID(out.Bytes()))
+	if _, err := os.Stat(carrierPath); !os.IsNotExist(err) {
+		t.Fatalf("a standalone checkpoint must not claim Entire capture with a carrier: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir(repo), sessionID, continuityCaptureFilename)); !os.IsNotExist(err) {
+		t.Fatalf("a standalone checkpoint must not create an Entire publication receipt: %v", err)
+	}
 }
 
-func TestCheckpointNotifiesEntireThroughSupportedTurnEnd(t *testing.T) {
+func TestCheckpointPublishesRedactedCarrierThroughEntireAttach(t *testing.T) {
 	repo := t.TempDir()
 	initGit(t, repo)
 	t.Setenv("ENTIRE_REPO_ROOT", repo)
 
-	const sessionID = "notified-checkpoint"
+	const (
+		sessionID = "notified-checkpoint"
+		secret    = "gsk_carrier-must-never-contain-a-raw-prompt"
+		rawPrompt = "Finish notification coverage using " + secret
+	)
 	fakeAider := writeFakeAider(t, repo, "notify", "notify.txt")
 	if err := Launch([]string{
 		"--repo", repo,
 		"--name", sessionID,
 		"--aider-bin", fakeAider,
-		"--message-file", writePromptFile(t, "finish notification coverage"),
+		"--message-file", writePromptFile(t, rawPrompt),
 		"--intent", "Finish notification coverage",
 	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
 		t.Fatal(err)
@@ -386,30 +420,94 @@ func TestCheckpointNotifiesEntireThroughSupportedTurnEnd(t *testing.T) {
 	if err := Run("install-hooks", []string{"--force"}, nil, ioDiscard{}); err != nil {
 		t.Fatal(err)
 	}
-	writeFakeEntireHook(t, repo)
+	writeFakeEntireAttach(t, repo)
 	t.Setenv("PATH", repo+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	decision := writeContinuityDecisionFile(t, map[string]any{
-		"goal":        "Tell Entire about the durable checkpoint",
-		"assumptions": []string{},
-		"failures":    []string{},
+		"goal":        "Attach the durable redacted checkpoint",
+		"assumptions": []string{"The source journal is already checkpointed by normal lifecycle hooks"},
+		"failures":    []string{"The raw prompt carried " + secret},
 		"open_risks":  []string{},
 	})
 	var first bytes.Buffer
 	if err := Checkpoint([]string{"--repo", repo, "--session", sessionID, "--brief-file", decision}, &first); err != nil {
 		t.Fatal(err)
 	}
-	hookArgs, err := os.ReadFile(filepath.Join(repo, "entire-hook.args"))
+	carrierID := continuityCarrierID(first.Bytes())
+	attachArgs, err := os.ReadFile(filepath.Join(repo, "entire-attach.args"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(hookArgs)) != "hooks aider turn-end" {
-		t.Fatalf("checkpoint must notify Entire with a supported capture hook, got %q", hookArgs)
+	if strings.TrimSpace(string(attachArgs)) != "session attach "+carrierID+" --agent aider" {
+		t.Fatalf("checkpoint must use Entire's real carrier attach path, got %q", attachArgs)
 	}
+	attachCWD, err := os.ReadFile(filepath.Join(repo, "entire-attach.cwd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(strings.TrimSpace(string(attachCWD))) != filepath.Clean(repo) {
+		t.Fatalf("Entire attach must run in the source repository, got %q", attachCWD)
+	}
+	gitTerminalPrompt, err := os.ReadFile(filepath.Join(repo, "entire-attach.git-terminal-prompt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(gitTerminalPrompt)) != "0" {
+		t.Fatalf("Entire attach must force the noninteractive Git path, got GIT_TERMINAL_PROMPT=%q", gitTerminalPrompt)
+	}
+	carrierJournal, err := os.ReadFile(filepath.Join(sessionDir(repo), carrierID, "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoPrivateContent(t, carrierJournal, rawPrompt, secret)
+	if strings.Contains(string(carrierJournal), `"event":"turn-end"`) {
+		t.Fatalf("carrier must not fake a lifecycle turn-end: %s", carrierJournal)
+	}
+	carrierBrief, err := readContinuityBrief(repo, carrierID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(carrierBrief, first.Bytes()) {
+		t.Fatalf("carrier must preserve the exact canonical brief\nwant=%q\n got=%q", first.Bytes(), carrierBrief)
+	}
+	carrierEvents, err := eventsFrom(carrierJournal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var milestone *journalEvent
+	for i := range carrierEvents {
+		if carrierEvents[i].SessionID != carrierID {
+			t.Fatalf("carrier journal mixed session IDs: %+v", carrierEvents[i])
+		}
+		if carrierEvents[i].Event == "checkpoint-milestone" {
+			milestone = &carrierEvents[i]
+		}
+	}
+	if milestone == nil || milestone.ContinuityBrief == nil || milestone.ContinuityBrief.MilestoneSessionID != carrierID || milestone.PreviousSessionID != sessionID || milestone.ContinuityCapture == nil || milestone.ContinuityCapture.SourceSessionID != sessionID || milestone.ContinuityCapture.SourceBriefPayloadID != continuityBriefPayloadID(*milestone.ContinuityBrief) {
+		t.Fatalf("carrier milestone lacks its source and brief binding: %+v", milestone)
+	}
+	if milestone.ContinuityCapture.SourceEvidenceID != milestone.ContinuityBrief.Evidence.IntegrityDigest {
+		t.Fatalf("carrier milestone lacks its source evidence binding: %+v", milestone.ContinuityCapture)
+	}
+	// Entire may redact the carrier after attach. A later local checkpoint retry
+	// must validate its manifest rather than reject the changed advisory prose.
+	milestone.ContinuityBrief.Goal = "Attach the REDACTED checkpoint"
+	carrierJournal, err = encodeJournalEvents(carrierEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFile(filepath.Join(sessionDir(repo), carrierID, "events.jsonl"), carrierJournal); err != nil {
+		t.Fatal(err)
+	}
+	receiptData, err := os.ReadFile(filepath.Join(sessionDir(repo), sessionID, continuityCaptureFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoPrivateContent(t, receiptData, rawPrompt, secret)
 
-	// Retrying a notification after it has already created the durable
-	// milestone must not demand the original decision file or append a second
-	// milestone. This is the recovery path if Entire was briefly unavailable.
+	// Retrying after publication must not demand the original decision, append
+	// another milestone, or invoke another capture. It is strictly an explicit,
+	// idempotent read of the completed milestone.
 	var retried bytes.Buffer
 	if err := Checkpoint([]string{"--repo", repo, "--session", sessionID}, &retried); err != nil {
 		t.Fatal(err)
@@ -423,6 +521,317 @@ func TestCheckpointNotifiesEntireThroughSupportedTurnEnd(t *testing.T) {
 	}
 	if strings.Count(string(journal), `"event":"checkpoint-milestone"`) != 1 {
 		t.Fatalf("checkpoint retry appended another milestone: %s", journal)
+	}
+	sourceEvents, err := eventsFrom(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turnEnds := 0
+	for _, event := range sourceEvents {
+		if event.Event == "turn-end" {
+			turnEnds++
+		}
+	}
+	if turnEnds != 1 {
+		t.Fatalf("checkpoint must not create a synthetic source turn-end: %s", journal)
+	}
+	invocations, err := os.ReadFile(filepath.Join(repo, "entire-attach.invocations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(invocations), "session attach "+carrierID+" --agent aider") != 1 {
+		t.Fatalf("completed checkpoint retried Entire attachment: %s", invocations)
+	}
+}
+
+func TestEntireCLIAdapterSurfacesOnlyTheSafeManualTrailer(t *testing.T) {
+	repo := t.TempDir()
+	writeFakeEntireAttach(t, repo)
+	t.Setenv("PATH", repo+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	carrierID := "aider-milestone-" + strings.Repeat("a", 32)
+	var stderr bytes.Buffer
+	if err := (entireCLIAdapter{stderr: &stderr}).Attach(context.Background(), repo, carrierID); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "aider-entire --resume "+carrierID) {
+		t.Fatalf("attach must expose the exact recovery session ID, got %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Entire-Checkpoint: abcdef123456") {
+		t.Fatalf("attach must forward Entire's validated manual trailer, got %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "diagnostic that must not be forwarded") {
+		t.Fatalf("attach must not forward arbitrary Entire output: %q", stderr.String())
+	}
+}
+
+func TestEntireCLIAdapterTreatsNonzeroExitAsAnUnknownOutcome(t *testing.T) {
+	repo := t.TempDir()
+	writeFailingEntireAttach(t, repo)
+	t.Setenv("PATH", repo+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	err := (entireCLIAdapter{}).Attach(context.Background(), repo, "aider-milestone-"+strings.Repeat("a", 32))
+	if err == nil || !errors.Is(err, errAttachmentOutcomeUnknown) {
+		t.Fatalf("nonzero attach must be ambiguous rather than retryable: %v", err)
+	}
+	if errors.Is(err, errAttachmentKnownNotPersisted) {
+		t.Fatalf("a started attach must never be classified as known-unpublished: %v", err)
+	}
+}
+
+func TestCheckpointDoesNotMarkDisabledEntireAsAttached(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+
+	const sessionID = "disabled-entire"
+	fakeAider := writeFakeAider(t, repo, "disabled", "disabled.txt")
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", sessionID,
+		"--aider-bin", fakeAider,
+		"--message-file", writePromptFile(t, "record a disabled Entire checkpoint"),
+		"--intent", "Record a disabled Entire checkpoint",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run("install-hooks", []string{"--force"}, nil, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	writeDisabledEntireAttach(t, repo)
+	t.Setenv("PATH", repo+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	decision := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        "Keep the checkpoint retryable while Entire is disabled",
+		"assumptions": []string{},
+		"failures":    []string{},
+		"open_risks":  []string{},
+	})
+	var first bytes.Buffer
+	err := Checkpoint([]string{"--repo", repo, "--session", sessionID, "--brief-file", decision}, &first)
+	if err == nil || !strings.Contains(err.Error(), "publication to Entire is pending") || first.Len() != 0 {
+		t.Fatalf("disabled Entire must leave a retryable local checkpoint: err=%v stdout=%q", err, first.String())
+	}
+	receiptPath := filepath.Join(sessionDir(repo), sessionID, continuityCaptureFilename)
+	receipt, exists, err := readContinuityCaptureReceipt(receiptPath)
+	if err != nil || !exists || receipt.PublicationState != "prepared" {
+		t.Fatalf("disabled Entire must not claim an attached receipt: receipt=%+v exists=%v err=%v", receipt, exists, err)
+	}
+
+	writeFakeEntireAttach(t, repo)
+	var retried bytes.Buffer
+	if err := Checkpoint([]string{"--repo", repo, "--session", sessionID}, &retried); err != nil {
+		t.Fatalf("checkpoint must succeed after Entire is re-enabled: %v", err)
+	}
+	if retried.Len() == 0 {
+		t.Fatal("successful retry must return the stored Continuity Brief")
+	}
+	receipt, exists, err = readContinuityCaptureReceipt(receiptPath)
+	if err != nil || !exists || receipt.PublicationState != "attached" {
+		t.Fatalf("re-enabled Entire must mark the receipt attached: receipt=%+v exists=%v err=%v", receipt, exists, err)
+	}
+}
+
+func TestCheckpointLeavesCarrierPendingUntilAnExplicitPublicationRetry(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+
+	const sessionID = "pending-publication"
+	fakeAider := writeFakeAider(t, repo, "pending", "pending.txt")
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", sessionID,
+		"--aider-bin", fakeAider,
+		"--message-file", writePromptFile(t, "record evidence before publication"),
+		"--intent", "Record evidence before publication",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run("install-hooks", []string{"--force"}, nil, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	decision := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        "Preserve a durable recovery point",
+		"assumptions": []string{},
+		"failures":    []string{},
+		"open_risks":  []string{},
+	})
+	publisher := &recordingCheckpointPublisher{
+		err: fmt.Errorf("%w: simulated Entire outage", errAttachmentKnownNotPersisted),
+		verify: func(root, carrierID string) error {
+			_, err := readContinuityBrief(root, carrierID)
+			return err
+		},
+	}
+	var first bytes.Buffer
+	err := checkpointWithPublisher([]string{"--repo", repo, "--session", sessionID, "--brief-file", decision}, &first, publisher)
+	if err == nil || !strings.Contains(err.Error(), "publication to Entire is pending") || first.Len() != 0 {
+		t.Fatalf("failed attach must leave a pending local milestone without stdout: err=%v stdout=%q", err, first.String())
+	}
+	brief, err := readContinuityBrief(repo, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	carrierID := continuityCarrierID(brief)
+	if len(publisher.calls) != 1 || publisher.calls[0] != carrierID {
+		t.Fatalf("expected one explicit publication attempt for %q, got %+v", carrierID, publisher.calls)
+	}
+	if _, err := readContinuityBrief(repo, carrierID); err != nil {
+		t.Fatalf("pending publication must retain a valid carrier: %v", err)
+	}
+	receiptPath := filepath.Join(sessionDir(repo), sessionID, continuityCaptureFilename)
+	receipt, exists, err := readContinuityCaptureReceipt(receiptPath)
+	if err != nil || !exists || receipt.PublicationState != "prepared" {
+		t.Fatalf("failed attach must leave prepared retry state: receipt=%+v exists=%v err=%v", receipt, exists, err)
+	}
+
+	publisher.err = nil
+	var retried bytes.Buffer
+	if err := checkpointWithPublisher([]string{"--repo", repo, "--session", sessionID}, &retried, publisher); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(retried.Bytes(), brief) {
+		t.Fatalf("explicit retry must return the original brief\nwant=%q\n got=%q", brief, retried.Bytes())
+	}
+	if len(publisher.calls) != 2 || publisher.calls[1] != carrierID {
+		t.Fatalf("only the explicit retry may make a second attach attempt: %+v", publisher.calls)
+	}
+	receipt, exists, err = readContinuityCaptureReceipt(receiptPath)
+	if err != nil || !exists || receipt.PublicationState != "attached" {
+		t.Fatalf("successful explicit retry must mark the carrier attached: receipt=%+v exists=%v err=%v", receipt, exists, err)
+	}
+
+	// A failed process can leave the receipt torn after Entire has already
+	// accepted the carrier. The next explicit checkpoint must reconcile against
+	// Entire metadata, never blindly create a second checkpoint.
+	if err := writePrivateFile(receiptPath, []byte(`{"publication_state":`)); err != nil {
+		t.Fatal(err)
+	}
+	publisher.calls = nil
+	publisher.findCalls = nil
+	var repaired bytes.Buffer
+	if err := checkpointWithPublisher([]string{"--repo", repo, "--session", sessionID}, &repaired, publisher); err != nil {
+		t.Fatalf("malformed receipt must reconcile through an explicit retry: %v", err)
+	}
+	if !bytes.Equal(repaired.Bytes(), brief) {
+		t.Fatalf("receipt reconciliation must return the original brief\nwant=%q\n got=%q", brief, repaired.Bytes())
+	}
+	if len(publisher.calls) != 0 || len(publisher.findCalls) != 1 || publisher.findCalls[0] != carrierID {
+		t.Fatalf("receipt reconciliation must query instead of reattaching %q: attach=%+v find=%+v", carrierID, publisher.calls, publisher.findCalls)
+	}
+	receipt, exists, err = readContinuityCaptureReceipt(receiptPath)
+	if err != nil || !exists || receipt.PublicationState != "attached" {
+		t.Fatalf("receipt reconciliation must restore attached state: receipt=%+v exists=%v err=%v", receipt, exists, err)
+	}
+
+	// An empty branch-scoped checkpoint query cannot prove absence. Without a
+	// positive match, a damaged receipt must stop rather than double-attach.
+	if err := writePrivateFile(receiptPath, []byte(`{"publication_state":`)); err != nil {
+		t.Fatal(err)
+	}
+	publisher.attached = false
+	publisher.calls = nil
+	publisher.findCalls = nil
+	var unknown bytes.Buffer
+	err = checkpointWithPublisher([]string{"--repo", repo, "--session", sessionID}, &unknown, publisher)
+	if err == nil || !strings.Contains(err.Error(), "publication state is unknown") || unknown.Len() != 0 {
+		t.Fatalf("unproven publication must fail closed without stdout: err=%v stdout=%q", err, unknown.String())
+	}
+	if len(publisher.calls) != 0 || len(publisher.findCalls) != 1 || publisher.findCalls[0] != carrierID {
+		t.Fatalf("unproven publication must reconcile without reattaching: attach=%+v find=%+v", publisher.calls, publisher.findCalls)
+	}
+}
+
+func TestCheckpointPublishesLegacyBriefWithoutEmbeddedCarrierID(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+
+	const sessionID = "legacy-carrier-id"
+	fakeAider := writeFakeAider(t, repo, "legacy", "legacy.txt")
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", sessionID,
+		"--aider-bin", fakeAider,
+		"--message-file", writePromptFile(t, "prepare a legacy checkpoint"),
+		"--intent", "Prepare a legacy checkpoint",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	decision := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        "Publish an existing schema-one checkpoint",
+		"assumptions": []string{},
+		"failures":    []string{},
+		"open_risks":  []string{},
+	})
+	if err := Checkpoint([]string{"--repo", repo, "--session", sessionID, "--brief-file", decision}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a Brief persisted by the first Ticket 3 implementation, before
+	// `milestone_session_id` existed. Its source journal must stay authoritative
+	// and cannot be rewritten merely to add a convenience recovery field.
+	briefPath := filepath.Join(sessionDir(repo), sessionID, continuityBriefFilename)
+	briefData, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacyBrief continuityBrief
+	if err := decodeStrictJSON(briefData, &legacyBrief); err != nil {
+		t.Fatal(err)
+	}
+	legacyBrief.MilestoneSessionID = ""
+	legacyData, err := json.Marshal(legacyBrief)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFile(briefPath, legacyData); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(sessionDir(repo), sessionID, "events.jsonl")
+	journal, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := eventsFrom(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range events {
+		if events[i].Event == "checkpoint-milestone" && events[i].ContinuityBrief != nil {
+			events[i].ContinuityBrief.MilestoneSessionID = ""
+		}
+	}
+	legacyJournal, err := encodeJournalEvents(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFile(journalPath, legacyJournal); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run("install-hooks", []string{"--force"}, nil, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+
+	publisher := &recordingCheckpointPublisher{}
+	var published bytes.Buffer
+	if err := checkpointWithPublisher([]string{"--repo", repo, "--session", sessionID}, &published, publisher); err != nil {
+		t.Fatalf("legacy checkpoint must remain publishable: %v", err)
+	}
+	if !bytes.Equal(published.Bytes(), legacyData) {
+		t.Fatalf("legacy retry must preserve its source Brief\nwant=%q\n got=%q", legacyData, published.Bytes())
+	}
+	carrierID := continuityCarrierID(legacyData)
+	if len(publisher.calls) != 1 || publisher.calls[0] != carrierID {
+		t.Fatalf("legacy retry must attach its derived carrier, got %+v", publisher.calls)
+	}
+	var resumed bytes.Buffer
+	if err := Resume([]string{"--repo", repo, "--resume", carrierID}, &resumed); err != nil {
+		t.Fatalf("legacy carrier must remain recoverable: %v", err)
+	}
+	if !bytes.Equal(resumed.Bytes(), legacyData) {
+		t.Fatalf("legacy carrier must return original Brief\nwant=%q\n got=%q", legacyData, resumed.Bytes())
 	}
 }
 
@@ -497,6 +906,174 @@ func TestResumeReturnsExactBriefWithoutRestartingAiderOrMutatingSession(t *testi
 	assertFileUnchanged(t, briefPath, briefBefore)
 	assertFileUnchanged(t, codePath, codeBefore)
 	assertFileUnchanged(t, invocationsPath, invocationsBefore)
+}
+
+func TestResumeRejectsTamperedJournalEvidence(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+
+	const sessionID = "integrity-checked"
+	fake := writeFakeAider(t, repo, "integrity", "integrity.txt")
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", sessionID,
+		"--aider-bin", fake,
+		"--message-file", writePromptFile(t, "make integrity evidence"),
+		"--intent", "Make integrity evidence",
+		"--model", "groq/verified-model",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	decision := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        "Recover only evidence that still matches the checkpoint",
+		"assumptions": []string{},
+		"failures":    []string{},
+		"open_risks":  []string{},
+	})
+	if err := Checkpoint([]string{"--repo", repo, "--session", sessionID, "--brief-file", decision}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(sessionDir(repo), sessionID, "events.jsonl")
+	journal, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := eventsFrom(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := false
+	for i := range events {
+		if events[i].Event == "turn-end" {
+			events[i].Model = "groq/tampered-model"
+			tampered = true
+			break
+		}
+	}
+	if !tampered {
+		t.Fatal("fixture lacks a turn-end evidence record")
+	}
+	tamperedJournal, err := encodeJournalEvents(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFile(journalPath, tamperedJournal); err != nil {
+		t.Fatal(err)
+	}
+	journalBeforeResume, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := Resume([]string{"--repo", repo, "--resume", sessionID}, &out); err == nil || !strings.Contains(err.Error(), "integrity digest") || out.Len() != 0 {
+		t.Fatalf("tampered evidence must fail closed: err=%v stdout=%q", err, out.String())
+	}
+	assertFileUnchanged(t, journalPath, journalBeforeResume)
+}
+
+func TestResumeValidatesCarrierBindingAndAcceptsEntireRedactedProse(t *testing.T) {
+	repo := t.TempDir()
+	initGit(t, repo)
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+
+	const sessionID = "carrier-integrity"
+	fake := writeFakeAider(t, repo, "carrier-integrity", "carrier-integrity.txt")
+	if err := Launch([]string{
+		"--repo", repo,
+		"--name", sessionID,
+		"--aider-bin", fake,
+		"--message-file", writePromptFile(t, "create carrier integrity evidence"),
+		"--intent", "Create carrier integrity evidence",
+	}, strings.NewReader(""), ioDiscard{}, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run("install-hooks", []string{"--force"}, nil, ioDiscard{}); err != nil {
+		t.Fatal(err)
+	}
+	decision := writeContinuityDecisionFile(t, map[string]any{
+		"goal":        "Carry Qn7mL2vX9kR4bY8pT6cH1wZ5fD3sG0jE through a safe handoff",
+		"assumptions": []string{},
+		"failures":    []string{},
+		"open_risks":  []string{},
+	})
+	var checkpoint bytes.Buffer
+	if err := checkpointWithPublisher([]string{"--repo", repo, "--session", sessionID, "--brief-file", decision}, &checkpoint, &recordingCheckpointPublisher{}); err != nil {
+		t.Fatal(err)
+	}
+	carrierID := continuityCarrierID(checkpoint.Bytes())
+	carrierPath := filepath.Join(sessionDir(repo), carrierID, "events.jsonl")
+	data, err := os.ReadFile(carrierPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := eventsFrom(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := false
+	for i := range events {
+		if events[i].Event == "checkpoint-milestone" && events[i].ContinuityCapture != nil {
+			events[i].ContinuityCapture.SourceBriefPayloadID = contentDigest("different brief")
+			tampered = true
+		}
+	}
+	if !tampered {
+		t.Fatal("fixture lacks a continuity carrier milestone")
+	}
+	tamperedData, err := encodeJournalEvents(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFile(carrierPath, tamperedData); err != nil {
+		t.Fatal(err)
+	}
+	beforeResume, err := os.ReadFile(carrierPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := Resume([]string{"--repo", repo, "--resume", carrierID}, &out); err == nil || !strings.Contains(err.Error(), "binding manifest") || out.Len() != 0 {
+		t.Fatalf("tampered carrier must fail closed: err=%v stdout=%q", err, out.String())
+	}
+	assertFileUnchanged(t, carrierPath, beforeResume)
+
+	// Entire applies another redaction pass while persisting the carrier. That
+	// pass can replace high-entropy decision prose, but it must not invalidate
+	// the redaction-invariant carrier binding manifest.
+	redactedEvents, err := eventsFrom(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redacted := false
+	for i := range redactedEvents {
+		if redactedEvents[i].Event != "checkpoint-milestone" || redactedEvents[i].ContinuityBrief == nil || redactedEvents[i].ContinuityCapture == nil {
+			continue
+		}
+		redactedEvents[i].ContinuityBrief.Goal = "Carry REDACTED through a safe handoff"
+		redacted = true
+	}
+	if !redacted {
+		t.Fatal("fixture lacks a redaction-compatible continuity carrier milestone")
+	}
+	redactedData, err := encodeJournalEvents(redactedEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFile(carrierPath, redactedData); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := Resume([]string{"--repo", repo, "--resume", carrierID}, &out); err != nil {
+		t.Fatalf("Entire-redacted carrier prose must remain resumable: %v", err)
+	}
+	var resumed continuityBrief
+	if err := decodeStrictJSON(out.Bytes(), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Goal != "Carry REDACTED through a safe handoff" {
+		t.Fatalf("resume must present Entire-redacted advisory prose, got %q", resumed.Goal)
+	}
 }
 
 func TestCheckpointAndResumeFailClosedForInvalidOrMismatchedSessionPaths(t *testing.T) {
@@ -860,16 +1437,27 @@ func writeFakeAider(t *testing.T, repo, name, changedFile string) string {
 	return path
 }
 
-func writeFakeEntireHook(t *testing.T, repo string) {
+func writeFakeEntireAttach(t *testing.T, repo string) {
 	t.Helper()
-	argsPath := filepath.Join(repo, "entire-hook.args")
+	argsPath := filepath.Join(repo, "entire-attach.args")
+	invocationsPath := filepath.Join(repo, "entire-attach.invocations")
+	cwdPath := filepath.Join(repo, "entire-attach.cwd")
+	promptPath := filepath.Join(repo, "entire-attach.git-terminal-prompt")
 	if runtime.GOOS == "windows" {
 		path := filepath.Join(repo, "entire.cmd")
 		body := "@echo off\r\n" +
-			"if /I not \"%1\"==\"hooks\" exit /b 1\r\n" +
-			"if /I not \"%2\"==\"aider\" exit /b 1\r\n" +
-			"if /I not \"%3\"==\"turn-end\" exit /b 1\r\n" +
+			"if /I not \"%1\"==\"session\" exit /b 1\r\n" +
+			"if /I not \"%2\"==\"attach\" exit /b 1\r\n" +
+			"if /I not \"%4\"==\"--agent\" exit /b 1\r\n" +
+			"if /I not \"%5\"==\"aider\" exit /b 1\r\n" +
+			"if not \"%6\"==\"\" exit /b 1\r\n" +
 			"echo %* > \"" + argsPath + "\"\r\n" +
+			"echo %* >> \"" + invocationsPath + "\"\r\n" +
+			"echo %CD% > \"" + cwdPath + "\"\r\n" +
+			"echo %GIT_TERMINAL_PROMPT% > \"" + promptPath + "\"\r\n" +
+			"echo Attached session %3\r\n" +
+			"echo Entire attach diagnostic that must not be forwarded\r\n" +
+			"echo   Entire-Checkpoint: abcdef123456\r\n" +
 			"exit /b 0\r\n"
 		if err := os.WriteFile(path, []byte(body), 0700); err != nil {
 			t.Fatal(err)
@@ -878,9 +1466,41 @@ func writeFakeEntireHook(t *testing.T, repo string) {
 	}
 	path := filepath.Join(repo, "entire")
 	body := "#!/usr/bin/env sh\n" +
-		"[ \"$1\" = hooks ] && [ \"$2\" = aider ] && [ \"$3\" = turn-end ] || exit 1\n" +
-		"printf '%s\\n' \"$*\" > " + shellQuote(argsPath) + "\n"
+		"[ \"$#\" -eq 5 ] && [ \"$1\" = session ] && [ \"$2\" = attach ] && [ \"$4\" = --agent ] && [ \"$5\" = aider ] || exit 1\n" +
+		"printf '%s\\n' \"$*\" > " + shellQuote(argsPath) + "\n" +
+		"printf '%s\\n' \"$*\" >> " + shellQuote(invocationsPath) + "\n" +
+		"pwd > " + shellQuote(cwdPath) + "\n" +
+		"printf '%s\\n' \"$GIT_TERMINAL_PROMPT\" > " + shellQuote(promptPath) + "\n" +
+		"printf 'Attached session %s\\n' \"$3\"\n" +
+		"printf '%s\\n' 'Entire attach diagnostic that must not be forwarded'\n" +
+		"printf '%s\\n' '  Entire-Checkpoint: abcdef123456'\n"
 	if err := os.WriteFile(path, []byte(body), 0700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeFailingEntireAttach(t *testing.T, repo string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		if err := os.WriteFile(filepath.Join(repo, "entire.cmd"), []byte("@echo off\r\nexit /b 7\r\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err := os.WriteFile(filepath.Join(repo, "entire"), []byte("#!/usr/bin/env sh\nexit 7\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeDisabledEntireAttach(t *testing.T, repo string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		if err := os.WriteFile(filepath.Join(repo, "entire.cmd"), []byte("@echo off\r\necho Entire is disabled. Run `entire enable` to re-enable.\r\nexit /b 0\r\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err := os.WriteFile(filepath.Join(repo, "entire"), []byte("#!/usr/bin/env sh\nprintf '%s\\n' 'Entire is disabled. Run `entire enable` to re-enable.'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -943,3 +1563,33 @@ func containsString(values []string, wanted string) bool {
 type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+type recordingCheckpointPublisher struct {
+	calls     []string
+	findCalls []string
+	err       error
+	findErr   error
+	attached  bool
+	verify    func(root, sessionID string) error
+}
+
+func (publisher *recordingCheckpointPublisher) Attach(_ context.Context, root, sessionID string) error {
+	publisher.calls = append(publisher.calls, sessionID)
+	if publisher.verify != nil {
+		if err := publisher.verify(root, sessionID); err != nil {
+			return err
+		}
+	}
+	if publisher.err == nil {
+		publisher.attached = true
+	}
+	return publisher.err
+}
+
+func (publisher *recordingCheckpointPublisher) FindAttached(_ context.Context, _ string, sessionID string) (bool, error) {
+	publisher.findCalls = append(publisher.findCalls, sessionID)
+	if publisher.findErr != nil {
+		return false, publisher.findErr
+	}
+	return publisher.attached, nil
+}

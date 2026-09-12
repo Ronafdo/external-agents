@@ -166,22 +166,31 @@ func TestResumeRecoversCheckpointRestoredByEntireWithoutSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 	decision := writeContinuityDecisionFile(t, map[string]any{
-		"goal":        "Resume checkout work from verified evidence",
+		"goal":        "Resume Qn7mL2vX9kR4bY8pT6cH1wZ5fD3sG0jE work from verified evidence",
 		"assumptions": []string{"Entire restored the canonical Aider transcript"},
 		"failures":    []string{},
 		"open_risks":  []string{"A developer must provide the next instruction"},
 	})
-	if err := Checkpoint([]string{"--repo", sourceRepo, "--session", sessionID, "--brief-file", decision}, ioDiscard{}); err != nil {
+	if err := Run("install-hooks", []string{"--force"}, nil, ioDiscard{}); err != nil {
 		t.Fatal(err)
 	}
+	publisher := &recordingCheckpointPublisher{}
+	var checkpoint bytes.Buffer
+	if err := checkpointWithPublisher([]string{"--repo", sourceRepo, "--session", sessionID, "--brief-file", decision}, &checkpoint, publisher); err != nil {
+		t.Fatal(err)
+	}
+	carrierID := continuityCarrierID(checkpoint.Bytes())
+	if len(publisher.calls) != 1 || publisher.calls[0] != carrierID {
+		t.Fatalf("checkpoint did not publish its carrier: %+v", publisher.calls)
+	}
 
-	sourceRef := filepath.Join(sessionDir(sourceRepo), sessionID, "events.jsonl")
+	sourceRef := filepath.Join(sessionDir(sourceRepo), carrierID, "events.jsonl")
 	sourceBrief, err := os.ReadFile(filepath.Join(sessionDir(sourceRepo), sessionID, continuityBriefFilename))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var exported bytes.Buffer
-	hookData, err := json.Marshal(hookInput{SessionID: sessionID, SessionRef: sourceRef})
+	hookData, err := json.Marshal(hookInput{SessionID: carrierID, SessionRef: sourceRef})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,19 +202,41 @@ func TestResumeRecoversCheckpointRestoredByEntireWithoutSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoPrivateContent(t, snapshot.NativeData, rawPrompt, secret, "simulated assistant response")
+	// Entire redacts the native data again at attach time. Model that concrete
+	// entropy-redaction result before its write-session restore boundary: the
+	// carrier binding remains stable while the decision prose becomes safer.
+	carrierEvents, err := eventsFrom(snapshot.NativeData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redacted := false
+	for i := range carrierEvents {
+		if carrierEvents[i].Event != "checkpoint-milestone" || carrierEvents[i].ContinuityBrief == nil {
+			continue
+		}
+		carrierEvents[i].ContinuityBrief.Goal = "Resume REDACTED work from verified evidence"
+		redacted = true
+	}
+	if !redacted {
+		t.Fatal("exported carrier lacks a Continuity Brief to redact")
+	}
+	snapshot.NativeData, err = encodeJournalEvents(carrierEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	restoredRepo := t.TempDir()
 	initGit(t, restoredRepo)
 	t.Setenv("ENTIRE_REPO_ROOT", restoredRepo)
-	restoredRef := filepath.Join(sessionDir(restoredRepo), sessionID, "events.jsonl")
-	restoreData, err := json.Marshal(session{SessionID: sessionID, SessionRef: restoredRef, NativeData: snapshot.NativeData})
+	restoredRef := filepath.Join(sessionDir(restoredRepo), carrierID, "events.jsonl")
+	restoreData, err := json.Marshal(session{SessionID: carrierID, SessionRef: restoredRef, NativeData: snapshot.NativeData})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := Run("write-session", nil, bytes.NewReader(restoreData), ioDiscard{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(sessionDir(restoredRepo), sessionID, continuityBriefFilename)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(sessionDir(restoredRepo), carrierID, continuityBriefFilename)); !os.IsNotExist(err) {
 		t.Fatalf("Entire restore must not need a launcher-local brief sidecar: %v", err)
 	}
 	restoredJournal, err := os.ReadFile(restoredRef)
@@ -224,13 +255,28 @@ func TestResumeRecoversCheckpointRestoredByEntireWithoutSidecar(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := Resume([]string{"--repo", restoredRepo, "--resume", sessionID}, &out); err != nil {
+	if err := Resume([]string{"--repo", restoredRepo, "--resume", carrierID}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(out.Bytes(), sourceBrief) {
-		t.Fatalf("restored resume must reconstruct the original brief\nwant=%q\n got=%q", sourceBrief, out.Bytes())
+	if bytes.Equal(out.Bytes(), sourceBrief) {
+		t.Fatalf("restored Brief should reflect Entire's additional redaction\nsource=%q\nrestored=%q", sourceBrief, out.Bytes())
 	}
 	assertNoPrivateContent(t, out.Bytes(), rawPrompt, secret, "simulated assistant response")
+	var resumed continuityBrief
+	if err := decodeStrictJSON(out.Bytes(), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Goal != "Resume REDACTED work from verified evidence" {
+		t.Fatalf("restored resume must preserve Entire-redacted prose, got %q", resumed.Goal)
+	}
+
+	// A restored checkout contains only the carrier. Source IDs intentionally do
+	// not trigger a directory scan, which prevents an arbitrary local carrier
+	// from being substituted for the original Aider Session.
+	out.Reset()
+	if err := Resume([]string{"--repo", restoredRepo, "--resume", sessionID}, &out); err == nil || out.Len() != 0 {
+		t.Fatalf("restored source ID must not resolve through an untrusted carrier scan: err=%v stdout=%q", err, out.String())
+	}
 }
 
 func TestExtractSummaryRejectsAnArbitraryFileReference(t *testing.T) {
